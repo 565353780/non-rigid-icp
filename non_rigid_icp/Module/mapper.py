@@ -1,12 +1,11 @@
 import os
-import numpy as np
 import open3d as o3d
 from typing import Union
 from copy import deepcopy
 
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.nricp import nonrigidIcp
-from non_rigid_icp.Method.render import renderMeshPair
+from non_rigid_icp.Method.render import renderColoredMeshes
 
 
 class Mapper(object):
@@ -33,25 +32,51 @@ class Mapper(object):
 
         sourcemesh = o3d.io.read_triangle_mesh(source_mesh_file_path)
         targetmesh = o3d.io.read_triangle_mesh(target_mesh_file_path)
-        sourcemesh.compute_vertex_normals()
-        targetmesh.compute_vertex_normals()
 
         if render:
-            renderMeshPair(sourcemesh, targetmesh)
+            renderColoredMeshes(
+                [
+                    sourcemesh,
+                    targetmesh,
+                ],
+                [
+                    [0.9, 0.1, 0.1],
+                    [0.1, 0.9, 0.1],
+                ]
+            )
 
-        initial_guess = np.eye(4)
-        affine_transform = icp(sourcemesh,targetmesh,initial_guess)
+        affine_transform = icp(sourcemesh,targetmesh)
 
         refined_sourcemesh = deepcopy(sourcemesh)
         refined_sourcemesh.transform(affine_transform)
         refined_sourcemesh.compute_vertex_normals()
 
         if render:
-            renderMeshPair(refined_sourcemesh, targetmesh)
+            renderColoredMeshes(
+                [
+                    refined_sourcemesh,
+                    targetmesh,
+                ],
+                [
+                    [0.1, 0.1, 0.9],
+                    [0.1, 0.9, 0.1],
+                ]
+            )
 
         deformed_mesh = nonrigidIcp(refined_sourcemesh,targetmesh)
 
         if render:
-            renderMeshPair(deformed_mesh, targetmesh)
+            renderColoredMeshes(
+                [
+                    sourcemesh,
+                    deformed_mesh,
+                    targetmesh,
+                ],
+                [
+                    [0.9, 0.1, 0.1],
+                    [0.1, 0.1, 0.9],
+                    [0.1, 0.9, 0.1],
+                ]
+            )
 
         return deformed_mesh

@@ -11,27 +11,26 @@ def choleskySolve(M, b):
     factor = cholesky_AAt(M.T)
     return factor(M.T.dot(b)).toarray()
 
-def nonrigidIcp(
-    sourcemesh: o3d.geometry.TriangleMesh,
-    targetmesh: o3d.geometry.TriangleMesh,
+def pointsNonRigidICP(
+    source_pts: np.ndarray,
+    target_pts: np.ndarray,
+    source_triangles: np.ndarray,
+    source_normals: Union[np.ndarray, None]=None,
+    target_normals: Union[np.ndarray, None]=None,
     normal_weighting: bool = False,
     gamma: float = 1.0,
     alphas: Union[list, np.ndarray] = np.linspace(200, 1, 20),
-):
-    refined_sourcemesh = deepcopy(sourcemesh)
-    #obtain vertices
-    target_vertices = np.array(targetmesh.vertices)
-    source_vertices = np.array(refined_sourcemesh.vertices)
+) -> np.ndarray:
     #num of source mesh vertices 
-    n_source_verts = source_vertices.shape[0]
+    n_source_verts = source_pts.shape[0]
 
     #normals again for refined source mesh and target mesh
-    source_mesh_normals = np.array(refined_sourcemesh.vertex_normals)
-    target_mesh_normals = np.array(targetmesh.vertex_normals)
+    source_mesh_normals = source_normals
+    target_mesh_normals = target_normals
 
-    knnsearch = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(target_vertices)
+    knnsearch = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(target_pts)
 
-    sourcemesh_faces = np.array(sourcemesh.triangles)
+    sourcemesh_faces = source_triangles
 
     #calculating edge info
     alledges=[]
@@ -61,7 +60,7 @@ def nonrigidIcp(
     D = sparse.lil_matrix((n_source_verts,n_source_verts*4), dtype=np.float32)
     j_=0
     for i in range(n_source_verts):
-        D[i,j_:j_+3]=source_vertices[i,:]
+        D[i,j_:j_+3]=source_pts[i,:]
         D[i,j_+3]=1
         j_+=4
 
@@ -92,7 +91,7 @@ def nonrigidIcp(
 
             indices = indices.squeeze()
 
-            matches = target_vertices[indices]
+            matches = target_pts[indices]
 
             #rigtnow setting threshold manualy, but if we have and landmark info we could set here
             mismatches = np.where(distances>0.02)[0]
@@ -124,11 +123,36 @@ def nonrigidIcp(
 
     vertsTransformed = D*X;
 
-    refined_sourcemesh.vertices = o3d.utility.Vector3dVector(vertsTransformed)
-
     #project source on to template
     matcheindices = np.where(wVec > 0)[0]
     vertsTransformed[matcheindices]=matches[matcheindices]
-    refined_sourcemesh.vertices = o3d.utility.Vector3dVector(vertsTransformed)
+
+    return vertsTransformed
+
+def nonrigidIcp(
+    sourcemesh: o3d.geometry.TriangleMesh,
+    targetmesh: o3d.geometry.TriangleMesh,
+    normal_weighting: bool = False,
+    gamma: float = 1.0,
+    alphas: Union[list, np.ndarray] = np.linspace(200, 1, 20),
+):
+    refined_sourcemesh = deepcopy(sourcemesh)
+    #obtain vertices
+    target_vertices = np.array(targetmesh.vertices)
+    source_vertices = np.array(refined_sourcemesh.vertices)
+    sourcemesh_faces = np.array(sourcemesh.triangles)
+
+    deformed_pts = pointsNonRigidICP(
+        source_vertices,
+        target_vertices,
+        sourcemesh_faces,
+        None,
+        None,
+        normal_weighting,
+        gamma,
+        alphas,
+    )
+
+    refined_sourcemesh.vertices = o3d.utility.Vector3dVector(deformed_pts)
 
     return refined_sourcemesh

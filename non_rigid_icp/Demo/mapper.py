@@ -2,8 +2,8 @@ from non_rigid_icp.Module.mapper import Mapper
 
 def demo():
     source_mesh_file_path = './data/source_test.obj'
-    target_mesh_file_path = './data/target_half.obj'
-    render = False
+    target_mesh_file_path = './data/target_full.obj'
+    render = True
 
     mapper = Mapper()
     deformed_mesh = mapper.mapMesh(
