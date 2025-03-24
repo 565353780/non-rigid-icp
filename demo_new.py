@@ -47,7 +47,7 @@ def pose_registration(
     return registered_mesh
 
 if __name__ == "__main__":
-    template_mesh_path = './data/SMPL_male.obj'
+    template_mesh_path = './data/SMPL_male.ply'
     target_mesh_path = './data/target.ply'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
