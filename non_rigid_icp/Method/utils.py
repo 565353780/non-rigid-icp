@@ -1,19 +1,7 @@
 import torch
 import numpy as np
 import open3d as o3d
-from typing import Tuple
 
-
-def toNormalizeTransform(
-    points: np.ndarray
-) -> Tuple[np.ndarray, float]:
-    min_bound = np.min(points, axis=0)
-    max_bound = np.max(points, axis=0)
-
-    center = (min_bound + max_bound) / 2.0
-    length = np.max(max_bound - min_bound)
-    scale = 0.9 / length
-    return center, scale
 
 def mesh_boundary(in_faces: torch.LongTensor, num_verts: int):
     '''
