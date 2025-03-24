@@ -1,70 +1,57 @@
 import os
-import json
-
 import torch
-import open3d as o3d
-import numpy as np
 import trimesh
+import numpy as np
+import open3d as o3d
 
-from optimal_step_nicp.utils import normalize_mesh
-from optimal_step_nicp.registration import registration_mesh2mesh
+from non_rigid_icp.Method.utils import toNormalizeTransform
+from non_rigid_icp.Method.registration import registration_mesh2mesh
 
-from optimal_step_nicp import DATADIR
-
-
-def pose_registration(tmpl_mesh_path: str,
-                      target_mesh_path: str,
-                      device=torch.device,
-                      config_path: str = None):
-
-    # load template mesh
+def pose_registration(
+    tmpl_mesh_path: str,
+    target_mesh_path: str,
+    device: str='cpu',
+) -> o3d.geometry.TriangleMesh:
     tri_mesh = trimesh.load_mesh(tmpl_mesh_path, process=True)
+    target_mesh = o3d.io.read_triangle_mesh(target_mesh_path,
+                                            enable_post_processing=True)
+
+    template_points = tri_mesh.vertices
+    target_points = np.asarray(target_mesh.vertices)
+
+    template_center, template_scale = toNormalizeTransform(template_points)
+    target_center, target_scale = toNormalizeTransform(target_points)
+
+    normalized_template_points = (template_points - template_center) * template_scale
+    normalized_target_points = (target_points - target_center) * target_scale
+
     template_mesh = o3d.geometry.TriangleMesh()
-    template_mesh.vertices = o3d.utility.Vector3dVector(tri_mesh.vertices)
+    template_mesh.vertices = o3d.utility.Vector3dVector(normalized_template_points)
     template_mesh.triangles = o3d.utility.Vector3iVector(tri_mesh.faces)
     template_mesh.compute_vertex_normals()
 
-    # load target mesh
-    target_mesh = o3d.io.read_triangle_mesh(target_mesh_path,
-                                            enable_post_processing=True)
+    target_mesh.vertices = o3d.utility.Vector3dVector(normalized_target_points)
     target_mesh.compute_vertex_normals()
-
-    with torch.no_grad():
-        template_mesh, _ = normalize_mesh(template_mesh)
-        target_mesh, _ = normalize_mesh(target_mesh)
-
-    with open(config_path, encoding='utf-8') as f:
-        config = json.load(f)
 
     registered_mesh = registration_mesh2mesh(template_mesh,
                                              target_mesh,
-                                             config,
                                              device=device)
+    assert isinstance(registered_mesh, o3d.geometry.TriangleMesh)
 
-    # Save the mesh to a file
-    print(registered_mesh)
+    registered_points = np.asarray(registered_mesh.vertices)
+    registered_points = registered_points / target_scale + target_center
+
+    registered_mesh.vertices = o3d.utility.Vector3dVector(registered_points)
     registered_mesh.compute_vertex_normals()
-    num_vertices = np.asarray(registered_mesh.vertices).shape[0]
-    gray_color = np.ones((num_vertices, 3)) * 0.5  # RGB values for gray
-    registered_mesh.vertex_colors = o3d.utility.Vector3dVector(gray_color)
 
-    o3d.io.write_triangle_mesh(os.path.join(DATADIR, "pose-registration.obj"),
-                               registered_mesh)
-
-
-def main():
-    device = torch.device(
-        'cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-
-    config_path = os.path.join(os.path.dirname(__file__), "optimal_step_nicp/config/config.json")
-    template_mesh_path = os.path.join(DATADIR, "SMPL_male.obj")
-    target_mesh_path = os.path.join(DATADIR, "target.ply")
-
-    pose_registration(template_mesh_path,
-                      target_mesh_path,
-                      device,
-                      config_path=config_path)
-
+    return registered_mesh
 
 if __name__ == "__main__":
-    main()
+    template_mesh_path = './data/SMPL_male.obj'
+    target_mesh_path = './data/target.ply'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    deformed_mesh = pose_registration(template_mesh_path, target_mesh_path, device)
+
+    os.makedirs('./output/', exist_ok=True)
+    o3d.io.write_triangle_mesh('./output/registered_mesh.ply', deformed_mesh)

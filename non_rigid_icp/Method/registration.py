@@ -5,26 +5,14 @@ from tqdm import tqdm
 from copy import deepcopy
 from scipy.spatial import KDTree
 
+from non_rigid_icp.Config.config import CONFIG
 from non_rigid_icp.Method.icp import icp
-
-from optimal_step_nicp.local_affine import AffineTransformLocal
-from optimal_step_nicp.utils import convert_mesh_to_pcl, mesh_boundary, laplacian_smoothing, batch_vertex_sample
-
-
-def registration_mesh2mesh(template_mesh: o3d.geometry.TriangleMesh,
-                           target_mesh: o3d.geometry.TriangleMesh,
-                           config: dict,
-                           device=torch.device('cpu')):
-    target_pcl = convert_mesh_to_pcl(target_mesh)
-    return registration_mesh2pcl(template_mesh,
-                                 target_pcl,
-                                 config,
-                                 device=device)
+from non_rigid_icp.Method.utils import convert_mesh_to_pcl, mesh_boundary, laplacian_smoothing
+from non_rigid_icp.Model.local_affine import AffineTransformLocal
 
 
 def registration_mesh2pcl(template_mesh: o3d.geometry.TriangleMesh,
                           target_pcl: o3d.geometry.PointCloud,
-                          config: dict,
                           out_affine=False,
                           in_affine=None,
                           device=torch.device('cpu')):
@@ -45,15 +33,15 @@ def registration_mesh2pcl(template_mesh: o3d.geometry.TriangleMesh,
     Returns:
     - o3d.geometry.TriangleMesh: The aligned source mesh after applying the non-rigid ICP algorithm.
     """
-    # Config
-    inner_iter = config['inner_iter']
-    outer_iter = config['outer_iter']
-    log_iter = config['log_iter']
-    loop = tqdm(range(outer_iter))
+    inner_iter = CONFIG['inner_iter']
+    outer_iter = CONFIG['outer_iter']
+    log_iter = CONFIG['log_iter']
 
-    milestones = set(config['milestones'])
-    stiffness_weights = np.array(config['stiffness_weights'])
-    laplacian_weight = config['laplacian_weight']
+    milestones = set(CONFIG['milestones'])
+    stiffness_weights = np.array(CONFIG['stiffness_weights'])
+    laplacian_weight = CONFIG['laplacian_weight']
+
+    loop = tqdm(range(outer_iter))
     w_idx = 0
 
     transformation = icp(template_mesh, target_pcl)
@@ -63,7 +51,7 @@ def registration_mesh2pcl(template_mesh: o3d.geometry.TriangleMesh,
     transformed_vertex = torch.tensor(np.asarray(
         transformed_mesh.vertices)).float().to(device).unsqueeze(0)
 
-    # Tmeplate vertices and faces
+    # Template vertices and faces
     template_vertex = torch.tensor(np.asarray(
         template_mesh.vertices)).float().to(device).unsqueeze(0)
     template_faces = torch.tensor(np.asarray(
@@ -192,7 +180,6 @@ def registration_mesh2pcl(template_mesh: o3d.geometry.TriangleMesh,
             new_deformed_mesh = template_mesh
 
         # final loss calculation in outer loop
-
         distance = torch.mean(
             torch.sqrt(torch.sum((old_verts - new_deformed_verts)**2, dim=2)))
         if i % log_iter == 0:
@@ -209,3 +196,11 @@ def registration_mesh2pcl(template_mesh: o3d.geometry.TriangleMesh,
         return new_deformed_mesh, local_affine_model
     else:
         return new_deformed_mesh
+
+def registration_mesh2mesh(template_mesh: o3d.geometry.TriangleMesh,
+                           target_mesh: o3d.geometry.TriangleMesh,
+                           device=torch.device('cpu')):
+    target_pcl = convert_mesh_to_pcl(target_mesh)
+    return registration_mesh2pcl(template_mesh,
+                                 target_pcl,
+                                 device=device)
