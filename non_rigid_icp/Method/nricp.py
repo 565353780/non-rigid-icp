@@ -21,20 +21,12 @@ def pointsNonRigidICP(
     gamma: float = 1.0,
     alphas: Union[list, np.ndarray] = np.linspace(200, 1, 20),
 ) -> np.ndarray:
-    #num of source mesh vertices 
-    n_source_verts = source_pts.shape[0]
-
-    #normals again for refined source mesh and target mesh
-    source_mesh_normals = source_normals
-    target_mesh_normals = target_normals
+    n_soutce_pts = source_pts.shape[0]
 
     knnsearch = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(target_pts)
 
-    sourcemesh_faces = source_triangles
-
-    #calculating edge info
     alledges=[]
-    for face in sourcemesh_faces:
+    for face in source_triangles:
         face = np.sort(face)
         alledges.append(tuple([face[0],face[1]]))
         alledges.append(tuple([face[0],face[2]]))
@@ -43,8 +35,7 @@ def pointsNonRigidICP(
     edges = set(alledges)
     n_source_edges = len(edges)
 
-
-    M = sparse.lil_matrix((n_source_edges, n_source_verts), dtype=np.float32)
+    M = sparse.lil_matrix((n_source_edges, n_soutce_pts), dtype=np.float32)
 
     for i, t in enumerate(edges):
         M[i, t[0]] = -1
@@ -55,25 +46,25 @@ def pointsNonRigidICP(
     kron_M_G = sparse.kron(M, G)
 
     # X for transformations and D for vertex info in sparse matrix
-    # using lil_matrix becaiuse chinging sparsity in csr is expensive 
+    # using lil_matrix becaiuse chinging sparsity in csr is expensive
     #Equation -> 8
-    D = sparse.lil_matrix((n_source_verts,n_source_verts*4), dtype=np.float32)
+    D = sparse.lil_matrix((n_soutce_pts,n_soutce_pts*4), dtype=np.float32)
     j_=0
-    for i in range(n_source_verts):
+    for i in range(n_soutce_pts):
         D[i,j_:j_+3]=source_pts[i,:]
         D[i,j_+3]=1
         j_+=4
 
     #AFFINE transformations stored in the 4n*3 format
     X_= np.concatenate((np.eye(3),np.array([[0,0,0]])),axis=0)
-    X = np.tile(X_,(n_source_verts,1))
+    X = np.tile(X_,(n_soutce_pts,1))
 
     if normal_weighting:
-        n_source_normals = len(source_mesh_normals) #will be equal to n_source_verts
+        n_source_normals = len(source_normals) #will be equal to n_soutce_pts
         DN = sparse.lil_matrix((n_source_normals,n_source_normals*4), dtype=np.float32)
         j_=0
         for i in range(n_source_normals):
-            DN[i,j_:j_+3]=source_mesh_normals[i,:]
+            DN[i,j_:j_+3]=source_normals[i,:]
             DN[i,j_+3]=1
             j_+=4
 
@@ -83,7 +74,7 @@ def pointsNonRigidICP(
 
         for i in range(3):
 
-            wVec = np.ones((n_source_verts,1))
+            wVec = np.ones((n_soutce_pts,1))
 
             vertsTransformed = D*X
 
@@ -98,7 +89,7 @@ def pointsNonRigidICP(
 
             if normal_weighting:
                 normalsTransformed = DN*X
-                corNormalsTarget = target_mesh_normals[indices]
+                corNormalsTarget = target_normals[indices]
                 crossNormals = np.cross(corNormalsTarget, normalsTransformed)
                 crossNormalsNorm = np.sqrt(np.sum(crossNormals**2,1))
                 dotNormals = np.sum(corNormalsTarget*normalsTransformed,1)
@@ -115,9 +106,9 @@ def pointsNonRigidICP(
 
             A = sparse.csr_matrix(sparse.vstack([alpha_stiffness * kron_M_G, D.multiply(wVec)]))
 
-            B = sparse.lil_matrix((4 * n_source_edges + n_source_verts, 3), dtype=np.float32)
+            B = sparse.lil_matrix((4 * n_source_edges + n_soutce_pts, 3), dtype=np.float32)
 
-            B[4 * n_source_edges: (4 * n_source_edges +n_source_verts), :] = U
+            B[4 * n_source_edges: (4 * n_source_edges +n_soutce_pts), :] = U
 
             X = choleskySolve(A, B)
 
