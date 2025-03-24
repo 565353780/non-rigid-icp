@@ -1,8 +1,15 @@
+import torch
 import trimesh
 import numpy as np
 import open3d as o3d
 from typing import Tuple
 
+
+def toTensor(array: np.ndarray, device: str = 'cpu', dtype = torch.float32) -> torch.Tensor:
+    return torch.tensor(np.asarray(array)).to(device, dtype=dtype)
+
+def toNumpy(tensor: torch.Tensor, dtype = np.float32) -> np.ndarray:
+    return tensor.detach().cpu().numpy().astype(dtype)
 
 def toO3DMesh(tri_mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     o3d_mesh = o3d.geometry.TriangleMesh()
