@@ -6,6 +6,7 @@ from copy import deepcopy
 
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.nricp import nonrigidIcp
+from non_rigid_icp.Method.render import renderMeshPair
 
 
 class Mapper(object):
@@ -36,7 +37,7 @@ class Mapper(object):
         targetmesh.compute_vertex_normals()
 
         if render:
-            o3d.visualization.draw_geometries([sourcemesh, targetmesh])
+            renderMeshPair(sourcemesh, targetmesh)
 
         initial_guess = np.eye(4)
         affine_transform = icp(sourcemesh,targetmesh,initial_guess)
@@ -46,15 +47,11 @@ class Mapper(object):
         refined_sourcemesh.compute_vertex_normals()
 
         if render:
-            o3d.visualization.draw_geometries([refined_sourcemesh, targetmesh])
+            renderMeshPair(refined_sourcemesh, targetmesh)
 
         deformed_mesh = nonrigidIcp(refined_sourcemesh,targetmesh)
 
-        sourcemesh.paint_uniform_color([0.1, 0.9, 0.1])
-        targetmesh.paint_uniform_color([0.9,0.1,0.1])
-        deformed_mesh.paint_uniform_color([0.1,0.1,0.9])
-
         if render:
-            o3d.visualization.draw_geometries([targetmesh,deformed_mesh])
+            renderMeshPair(deformed_mesh, targetmesh)
 
         return deformed_mesh

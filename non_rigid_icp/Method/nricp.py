@@ -1,5 +1,6 @@
 import numpy as np
 import open3d as o3d
+from typing import Union
 from scipy import sparse
 from copy import deepcopy
 from sksparse.cholmod import cholesky_AAt
@@ -10,12 +11,13 @@ def choleskySolve(M, b):
     factor = cholesky_AAt(M.T)
     return factor(M.T.dot(b)).toarray()
 
-Debug=True
-normalWeighting=False
-gamma = 1
-alphas = np.linspace(200,1,20)
-
-def nonrigidIcp(sourcemesh,targetmesh):
+def nonrigidIcp(
+    sourcemesh: o3d.geometry.TriangleMesh,
+    targetmesh: o3d.geometry.TriangleMesh,
+    normal_weighting: bool = False,
+    gamma: float = 1.0,
+    alphas: Union[list, np.ndarray] = np.linspace(200, 1, 20),
+):
     refined_sourcemesh = deepcopy(sourcemesh)
     #obtain vertices
     target_vertices = np.array(targetmesh.vertices)
@@ -26,7 +28,6 @@ def nonrigidIcp(sourcemesh,targetmesh):
     #normals again for refined source mesh and target mesh
     source_mesh_normals = np.array(refined_sourcemesh.vertex_normals)
     target_mesh_normals = np.array(targetmesh.vertex_normals)
-
 
     knnsearch = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(target_vertices)
 
@@ -68,12 +69,7 @@ def nonrigidIcp(sourcemesh,targetmesh):
     X_= np.concatenate((np.eye(3),np.array([[0,0,0]])),axis=0)
     X = np.tile(X_,(n_source_verts,1))
 
-    if Debug:
-        targetmesh.paint_uniform_color([0.9,0.1,0.1])
-        refined_sourcemesh.paint_uniform_color([0.1,0.1,0.9])
-        o3d.visualization.draw_geometries([targetmesh,refined_sourcemesh])
-
-    if normalWeighting:
+    if normal_weighting:
         n_source_normals = len(source_mesh_normals) #will be equal to n_source_verts
         DN = sparse.lil_matrix((n_source_normals,n_source_normals*4), dtype=np.float32)
         j_=0
@@ -101,7 +97,7 @@ def nonrigidIcp(sourcemesh,targetmesh):
             #rigtnow setting threshold manualy, but if we have and landmark info we could set here
             mismatches = np.where(distances>0.02)[0]
 
-            if normalWeighting:
+            if normal_weighting:
                 normalsTransformed = DN*X
                 corNormalsTarget = target_mesh_normals[indices]
                 crossNormals = np.cross(corNormalsTarget, normalsTransformed)
