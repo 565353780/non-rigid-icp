@@ -3,7 +3,8 @@ import numpy as np
 import open3d as o3d
 from tqdm import tqdm
 from copy import deepcopy
-from scipy.spatial import KDTree
+
+from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.trans import toTensor, toNumpy
@@ -39,6 +40,8 @@ def registration_mesh2pcl(
     Returns:
     - o3d.geometry.TriangleMesh: The aligned source mesh after applying the non-rigid ICP algorithm.
     """
+    chamLoss = chamfer_3DDist()
+
     loop = tqdm(range(outer_iter))
     w_idx = 0
 
@@ -51,10 +54,7 @@ def registration_mesh2pcl(
     template_vertex = toTensor(template_mesh.vertices, device)
 
     target_vertex_np = np.asarray(target_pcl.points)
-    target_vertex = toTensor(target_vertex_np, device)
-
-    # build a KDTree for efficient nearest neighbor search
-    tree = KDTree(target_vertex_np)
+    target_vertex = toTensor(target_vertex_np, device).unsqueeze(0)
 
     # define the transformation model (Local Affine Transform)
     triangles = np.asarray(template_mesh.triangles)
@@ -84,25 +84,14 @@ def registration_mesh2pcl(
         new_deformed_verts, stiffness = local_affine_model(
             transformed_vertex, return_stiff=True)
 
-        old_verts = new_deformed_verts
-        new_deformed_mesh = template_mesh
-
-        # set new template vertices based on transformation
-        new_deformed_mesh.vertices = o3d.utility.Vector3dVector(
-            toNumpy(new_deformed_verts, np.float64))
-
-        new_deformed_verts_np = toNumpy(new_deformed_verts)
-
-        # Query the KDTree for the nearest neighbor to find closeset points on target mesh/point cloud
-        distances, indices = tree.query(new_deformed_verts_np, k=1)
-
-        indices = toTensor(indices, device, torch.int64)
-        close_points = target_vertex[indices, :]
+        dist1, dist2, idx1, idx2 = chamLoss(new_deformed_verts.unsqueeze(0), target_vertex)
 
         if (i == 0) and (in_affine is None):
             inner_loop = range(4)
         else:
             inner_loop = range(inner_iter)
+
+        close_points = target_vertex[0, idx1.squeeze(0)]
 
         # enter inner loop
         for _ in inner_loop:
@@ -115,9 +104,6 @@ def registration_mesh2pcl(
 
             weight_mask = vert_distance_mask.unsqueeze(-1)
 
-            # multipley mask by vert_distance to select vertex that match conditions,
-            # specifically that the distance should be less than 0.04**2
-            # multiplying False/True by number gives 0/1
             vert_distance = weight_mask * vert_distance
 
             # This is the first term of the Loss function
@@ -128,7 +114,10 @@ def registration_mesh2pcl(
 
             # Laplacian smoothing loss term
             # It describes how a vertex deviates from the average of its neighbors
-            laplacian_loss = laplacian_smoothing(new_deformed_mesh)
+            template_mesh.vertices = o3d.utility.Vector3dVector(
+                toNumpy(new_deformed_verts, np.float64))
+
+            laplacian_loss = laplacian_smoothing(template_mesh)
 
             # Laplacian weight
             laplacian_loss = laplacian_loss * laplacian_weight
@@ -148,9 +137,7 @@ def registration_mesh2pcl(
             new_deformed_mesh = template_mesh
 
         # final loss calculation in outer loop
-        distance = torch.mean(
-            torch.sqrt(torch.sum((old_verts - new_deformed_verts)**2, dim=1)))
-        print(distance.item(), stiffness_sum.item(), vert_sum.item(), laplacian_loss.item())
+        print(stiffness_sum.item(), vert_sum.item(), laplacian_loss.item())
 
         if i in milestones:
             w_idx += 1

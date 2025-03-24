@@ -49,11 +49,10 @@ def pointsNonRigidICP(
     # using lil_matrix becaiuse chinging sparsity in csr is expensive
     #Equation -> 8
     D = sparse.lil_matrix((n_soutce_pts,n_soutce_pts*4), dtype=np.float32)
-    j_=0
     for i in range(n_soutce_pts):
-        D[i,j_:j_+3]=source_pts[i,:]
-        D[i,j_+3]=1
-        j_+=4
+        j = 4 * i
+        D[i, j:j+3]=source_pts[i,:]
+        D[i, j+3]=1
 
     #AFFINE transformations stored in the 4n*3 format
     X_= np.concatenate((np.eye(3),np.array([[0,0,0]])),axis=0)
@@ -84,7 +83,7 @@ def pointsNonRigidICP(
 
             matches = target_pts[indices]
 
-            #rigtnow setting threshold manualy, but if we have and landmark info we could set here
+            #rigtnow setting threshold manualy, but if we have any landmark info we could set here
             mismatches = np.where(distances>0.02)[0]
 
             if normal_weighting:
