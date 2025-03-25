@@ -333,7 +333,11 @@ class OptimalMapper(object):
         self.updateTemplateVertices(new_deformed_verts)
 
         if self.render:
-            toVideo(save_deformed_image_folder_path, self.save_result_folder_path + 'Deform.mp4', 10)
+            save_video_file_path = self.save_result_folder_path + 'Deform.mp4'
+            fps = 10
+            toVideo(save_deformed_image_folder_path, save_video_file_path, fps)
+
+            self.logger.addVideoFile('Deform', save_video_file_path, fps)
         return True
 
     def toDeformedTemplateMesh(self) -> o3d.geometry.TriangleMesh:

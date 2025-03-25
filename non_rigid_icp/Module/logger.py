@@ -1,11 +1,13 @@
 import os
+import cv2
 import torch
 import trimesh
 import numpy as np
 import open3d as o3d
 from typing import Union
-
 from torch.utils.tensorboard import SummaryWriter
+
+from non_rigid_icp.Method.trans import toNumpy
 
 
 class Logger(object):
@@ -86,6 +88,75 @@ class Logger(object):
         image = image.transpose(2, 0, 1)
 
         self.summary_writer.add_image(name, image, name_step)
+        return True
+
+    def addVideo(
+        self,
+        name: str,
+        video: Union[torch.Tensor, np.ndarray],
+        fps: int = 10,
+        step: Union[int, None] = None,
+    ) -> bool:
+        if not self.isValid():
+            if self.is_mute or self.error_outputed:
+                return False
+
+            print("[ERROR][Logger::addVideo]")
+            print("\t isValid failed!")
+            self.error_outputed = True
+            return False
+
+        if step is not None:
+            self.setStep(name, step)
+
+        name_step = self.getNameStep(name)
+
+        if isinstance(video, torch.Tensor):
+            video_tensor = video
+        else:
+            video_tensor = torch.tensor(toNumpy(video), dtype=torch.uint8)
+
+        if len(video_tensor.shape) == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+
+        self.summary_writer.add_video(name, video_tensor, name_step, fps)
+        return True
+
+    def addVideoFile(
+        self,
+        name: str,
+        video_file_path: str,
+        fps: int = 10,
+        step: Union[int, None] = None,
+    ) -> bool:
+        if not os.path.exists(video_file_path):
+            if self.is_mute:
+                return False
+
+            print("[ERROR][Logger::addVideoFile]")
+            print("\t video file not exist!")
+            print('\t video_file_path:', video_file_path)
+            return False
+
+        cap = cv2.VideoCapture(video_file_path)
+
+        frames = []
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = torch.tensor(frame, dtype=torch.uint8).permute(2, 0, 1)
+            frames.append(frame)
+
+        cap.release()
+
+        video_tensor = torch.stack(frames).unsqueeze(0)
+
+        if not self.addVideo(name, video_tensor, fps, step):
+            print("[ERROR][Logger::addVideoFile]")
+            print("\t addVideo failed!")
+            return False
         return True
 
     def addPointCloud(self, name: str, pcd: Union[o3d.geometry.PointCloud, np.ndarray, torch.Tensor], step: Union[int, None]=None) -> bool:
