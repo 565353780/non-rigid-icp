@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import numpy as np
 import open3d as o3d
@@ -13,6 +14,7 @@ from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
 from non_rigid_icp.Method.render import renderGeometry, renderPoints
 from non_rigid_icp.Method.trans import toMesh, toNormalizeTransform, toTensor, transGeometry, transPoints
+from non_rigid_icp.Method.video import toVideo
 from non_rigid_icp.Model.local_affine import AffineTransformLocal
 from non_rigid_icp.Metric.chamfer import toL1ChamferDistance
 from non_rigid_icp.Module.logger import Logger
@@ -29,6 +31,7 @@ class OptimalMapper(object):
         device: str='cpu',
         save_result_folder_path: Union[str, None] = None,
         save_log_folder_path: Union[str, None] = None,
+        render: bool=False,
     ) -> None:
         self.inner_iter = inner_iter
         self.outer_iter = outer_iter
@@ -41,6 +44,7 @@ class OptimalMapper(object):
 
         self.save_result_folder_path = save_result_folder_path
         self.save_log_folder_path = save_log_folder_path
+        self.render = render
 
         self.logger = Logger()
 
@@ -59,6 +63,9 @@ class OptimalMapper(object):
 
         self.template_vertices = None
         self.template_triangles = None
+
+        # tmp
+        self.save_deform_image_idx = 0
         return
 
     def isGTValid(self) -> bool:
@@ -125,12 +132,15 @@ class OptimalMapper(object):
 
         self.gt_points = toTensor(self.gt_points, self.device).unsqueeze(0)
 
-        image = renderGeometry(
-            self.gt_geometry,
-            phi=self.phi,
-            theta=self.theta,
-            radius=self.radius)
-        self.logger.addImage('GT', image)
+        if self.render:
+            image = renderGeometry(
+                self.gt_geometry,
+                phi=self.phi,
+                theta=self.theta,
+                radius=self.radius)
+            self.logger.addImage('GT', image)
+            if self.save_result_folder_path is not None:
+                cv2.imwrite(self.save_result_folder_path + 'GT.jpg', image)
         return True
 
     def normalizeTemplateMesh(self) -> bool:
@@ -146,13 +156,16 @@ class OptimalMapper(object):
         self.template_vertices = toTensor(self.template_vertices, self.device)
         self.template_triangles = toTensor(self.template_triangles, self.device, torch.int64)
 
-        image = renderPoints(
-            self.template_vertices,
-            self.template_triangles,
-            phi=self.phi,
-            theta=self.theta,
-            radius=self.radius)
-        self.logger.addImage('Template', image)
+        if self.render:
+            image = renderPoints(
+                self.template_vertices,
+                self.template_triangles,
+                phi=self.phi,
+                theta=self.theta,
+                radius=self.radius)
+            self.logger.addImage('Template', image)
+            if self.save_result_folder_path is not None:
+                cv2.imwrite(self.save_result_folder_path + 'Template.jpg', image)
         return True
 
     def loadGTPcd(self, gt_pcd: o3d.geometry.PointCloud) -> bool:
@@ -219,13 +232,16 @@ class OptimalMapper(object):
 
         self.updateTemplateVertices(template_mesh.vertices)
 
-        image = renderPoints(
-            self.template_vertices,
-            self.template_triangles,
-            phi=self.phi,
-            theta=self.theta,
-            radius=self.radius)
-        self.logger.addImage('ICP', image)
+        if self.render:
+            image = renderPoints(
+                self.template_vertices,
+                self.template_triangles,
+                phi=self.phi,
+                theta=self.theta,
+                radius=self.radius)
+            self.logger.addImage('ICP', image)
+            if self.save_result_folder_path is not None:
+                cv2.imwrite(self.save_result_folder_path + 'ICP.jpg', image)
         return True
 
     def refineGeometry(
@@ -235,6 +251,9 @@ class OptimalMapper(object):
             print('[ERROR][OptimalMapper::refineGeometry]')
             print('\t isValid failed!')
             return False
+
+        save_deformed_image_folder_path = self.save_result_folder_path + 'DeformedMesh/'
+        os.makedirs(save_deformed_image_folder_path, exist_ok=True)
 
         loop = trange(self.outer_iter)
         w_idx = 0
@@ -268,23 +287,21 @@ class OptimalMapper(object):
                 new_deformed_verts = local_affine_model(self.template_vertices)
                 stiffness = local_affine_model.stiffness()
 
-                vert_sum = toMaskedDistLoss(new_deformed_verts, close_points)
+                masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points)
 
-                stiffness_sum = self.stiffness_weights[w_idx] * torch.sum(stiffness)
+                stiffness_loss = self.stiffness_weights[w_idx] * torch.sum(stiffness)
 
                 laplacian_loss = toLaplacianLoss(
                     new_deformed_verts, self.template_triangles, source_laplacian)
 
-                # Laplacian weight
                 laplacian_loss = self.laplacian_weight * laplacian_loss
 
-                # sum up all the loss terms
-                loss = torch.sqrt(vert_sum + stiffness_sum) + laplacian_loss
+                loss = torch.sqrt(masked_dist_loss + stiffness_loss) + laplacian_loss
                 loss.backward()
                 optimizer.step()
 
-                self.logger.addScalar('Loss/Stiffness', stiffness_sum.item(), step)
-                self.logger.addScalar('Loss/MatchingDist', vert_sum.item(), step)
+                self.logger.addScalar('Loss/Stiffness', stiffness_loss.item(), step)
+                self.logger.addScalar('Loss/MatchingDist', masked_dist_loss.item(), step)
                 self.logger.addScalar('Loss/Laplacian', laplacian_loss.item(), step)
 
                 step += 1
@@ -293,24 +310,30 @@ class OptimalMapper(object):
             l1_chamfer = toL1ChamferDistance(dist1, dist2)
             self.logger.addScalar('Metric/L1-Chamfer', l1_chamfer, step)
 
-            new_deformed_verts = local_affine_model(self.template_vertices)
-            image = renderPoints(
-                new_deformed_verts,
-                self.template_triangles,
-                phi=self.phi,
-                theta=self.theta,
-                radius=self.radius
-            )
-            self.logger.addImage('DeformedMesh', image, step)
+            if self.render:
+                new_deformed_verts = local_affine_model(self.template_vertices)
+                image = renderPoints(
+                    new_deformed_verts,
+                    self.template_triangles,
+                    phi=self.phi,
+                    theta=self.theta,
+                    radius=self.radius
+                )
+                self.logger.addImage('DeformedMesh', image, step)
+                if self.save_result_folder_path is not None:
+                    cv2.imwrite(save_deformed_image_folder_path + str(self.save_deform_image_idx) + '.jpg', image)
+                    self.save_deform_image_idx += 1
 
-            # final loss calculation in outer loop
-            print(l1_chamfer, stiffness_sum.item(), vert_sum.item(), laplacian_loss.item())
+            print(l1_chamfer, stiffness_loss.item(), masked_dist_loss.item(), laplacian_loss.item())
 
             if i in self.milestones:
                 w_idx += 1
 
         new_deformed_verts = local_affine_model(self.template_vertices)
         self.updateTemplateVertices(new_deformed_verts)
+
+        if self.render:
+            toVideo(save_deformed_image_folder_path, self.save_result_folder_path + 'Deform.mp4', 10)
         return True
 
     def toDeformedTemplateMesh(self) -> o3d.geometry.TriangleMesh:

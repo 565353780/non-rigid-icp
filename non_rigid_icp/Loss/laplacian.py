@@ -46,17 +46,6 @@ def toLaplacian(vertices: torch.Tensor, triangles: torch.Tensor) -> torch.Tensor
 
     return laplacian
 
-def laplacian_smoothing(vertices: torch.Tensor, triangles: torch.Tensor):
-    laplacian = toLaplacian(vertices, triangles)
-
-    # Calculate Laplacian loss
-    laplacian_loss = torch.sum(laplacian**2)
-
-    # new_vertices = vertices - 0.5 * laplacian
-
-    return laplacian_loss
-
-
 def toLaplacianLoss(
     vertices: torch.Tensor,
     triangles: torch.Tensor,

@@ -13,6 +13,7 @@ def demo():
     device = 'cuda'
     save_result_folder_path = 'auto'
     save_log_folder_path = 'auto'
+    render = True
 
     optimal_mapper = OptimalMapper(
         inner_iter,
@@ -23,6 +24,7 @@ def demo():
         device,
         save_result_folder_path,
         save_log_folder_path,
+        render,
     )
 
     optimal_mapper.loadGTMeshFile(target_mesh_file_path)
