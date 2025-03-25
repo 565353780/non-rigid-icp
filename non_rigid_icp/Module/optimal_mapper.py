@@ -6,12 +6,13 @@ from tqdm import trange
 from typing import Union
 
 from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
+from non_rigid_icp.Loss.masked_dist import toMaskedDistLoss
+from non_rigid_icp.Loss.laplacian import toLaplacian, toLaplacianLoss
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
 from non_rigid_icp.Method.render import renderGeometry, renderPoints
 from non_rigid_icp.Method.trans import toMesh, toNormalizeTransform, toTensor, transGeometry, transPoints
-from non_rigid_icp.Method.utils import laplacian_smoothing
 from non_rigid_icp.Model.local_affine import AffineTransformLocal
 from non_rigid_icp.Metric.chamfer import toL1ChamferDistance
 from non_rigid_icp.Module.logger import Logger
@@ -238,6 +239,8 @@ class OptimalMapper(object):
         loop = trange(self.outer_iter)
         w_idx = 0
 
+        source_laplacian = toLaplacian(self.template_vertices, self.template_triangles)
+
         local_affine_model = AffineTransformLocal(
             self.template_vertices.shape[0], self.template_triangles).to(self.device)
 
@@ -265,19 +268,12 @@ class OptimalMapper(object):
                 new_deformed_verts = local_affine_model(self.template_vertices)
                 stiffness = local_affine_model.stiffness()
 
-                vert_distance = (new_deformed_verts - close_points)**2
-
-                vert_distance_mask = torch.sum(vert_distance, dim=1) < 0.04**2
-
-                weight_mask = vert_distance_mask.unsqueeze(-1)
-
-                vert_distance = weight_mask * vert_distance
-
-                vert_sum = torch.sum(vert_distance)
+                vert_sum = toMaskedDistLoss(new_deformed_verts, close_points)
 
                 stiffness_sum = self.stiffness_weights[w_idx] * torch.sum(stiffness)
 
-                laplacian_loss = laplacian_smoothing(new_deformed_verts, self.template_triangles)
+                laplacian_loss = toLaplacianLoss(
+                    new_deformed_verts, self.template_triangles, source_laplacian)
 
                 # Laplacian weight
                 laplacian_loss = self.laplacian_weight * laplacian_loss

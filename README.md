@@ -17,7 +17,7 @@ python demo.py
 ## Visualization
 
 ```bash
-tensorboard --logdir ./logs --host 0.0.0.0 --port 6006
+tensorboard --logdir ./logs --host 0.0.0.0 --port 6006 --samples_per_plugin images=100
 ```
 
 and then open

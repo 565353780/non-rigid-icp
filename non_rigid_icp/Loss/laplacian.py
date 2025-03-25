@@ -31,7 +31,7 @@ def get_adjacency_matrix(vertices: torch.Tensor, triangles: torch.Tensor):
 
     return adjacency_matrix, degree_matrix
 
-def laplacian_smoothing(vertices: torch.Tensor, triangles: torch.Tensor, lamb=0.5):
+def toLaplacian(vertices: torch.Tensor, triangles: torch.Tensor) -> torch.Tensor:
     # Get adjacency matrix
     adjacency_matrix, degree_matrix = get_adjacency_matrix(vertices, triangles)
 
@@ -44,10 +44,28 @@ def laplacian_smoothing(vertices: torch.Tensor, triangles: torch.Tensor, lamb=0.
     # Calculate Laplacian of each vertex
     laplacian = torch.matmul(laplacian_matrix, vertices)
 
+    return laplacian
+
+def laplacian_smoothing(vertices: torch.Tensor, triangles: torch.Tensor):
+    laplacian = toLaplacian(vertices, triangles)
+
     # Calculate Laplacian loss
     laplacian_loss = torch.sum(laplacian**2)
 
-    # FIXME:Move each vertex towards the average position of its neighbors
-    # new_vertices = vertices - lamb * laplacian
+    # new_vertices = vertices - 0.5 * laplacian
+
+    return laplacian_loss
+
+
+def toLaplacianLoss(
+    vertices: torch.Tensor,
+    triangles: torch.Tensor,
+    source_laplacian: torch.Tensor,
+) -> torch.Tensor:
+    laplacian = toLaplacian(vertices, triangles)
+
+    laplacian_dists2 = (laplacian - source_laplacian) ** 2
+
+    laplacian_loss = torch.mean(laplacian_dists2)
 
     return laplacian_loss
