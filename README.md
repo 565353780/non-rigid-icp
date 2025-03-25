@@ -14,4 +14,18 @@ conda activate nricp
 python demo.py
 ```
 
+## Visualization
+
+```bash
+tensorboard --logdir ./logs --host 0.0.0.0 --port 6006
+```
+
+and then open
+
+```bash
+127.0.0.1:6006
+```
+
+for visualization
+
 ## Enjoy it~
