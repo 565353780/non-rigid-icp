@@ -1,5 +1,8 @@
 import torch
-import torch.nn as nn
+import numpy as np
+from torch import nn
+
+from non_rigid_icp.Method.trans import toNumpy, toTensor
 
 
 class AffineTransformLocal(nn.Module):
@@ -10,17 +13,26 @@ class AffineTransformLocal(nn.Module):
     The module includes stiffness term to ensure that the close points have similar transformation.
     """
 
-    def __init__(self, num_points: int, edges: torch.Tensor):
+    def __init__(self, vertex_num: int, triangles: torch.Tensor):
         """
         Initializes the LocalAffine module with the specified number of points and batch size.
         """
         super(AffineTransformLocal, self).__init__()
+
+        triangles = toNumpy(triangles)
+
+        edges = np.vstack(
+            [triangles[:, :2], triangles[:, 1:3], triangles[:, [0, 2]]])
+        edges = np.sort(edges, axis=1)
+        edges = np.unique(edges, axis=0)
+
+        edges = toTensor(edges, dtype=torch.int64)
+        self.register_buffer("edges", edges)
+
         self.A = nn.Parameter(
-            torch.eye(3).reshape(1, 3, 3).repeat(num_points, 1, 1))  # N * 3 * 3
+            torch.eye(3).reshape(1, 3, 3).repeat(vertex_num, 1, 1))  # N * 3 * 3
         self.b = nn.Parameter(
-            torch.zeros(3).reshape(1, 3, 1).repeat(num_points, 1, 1))  # N * 3 * 1
-        self.edges = edges
-        self.num_points = num_points
+            torch.zeros(3).reshape(1, 3, 1).repeat(vertex_num, 1, 1))  # N * 3 * 1
         return
 
     def stiffness(self):
@@ -32,30 +44,8 @@ class AffineTransformLocal(nn.Module):
         w_diff = (w1 - w2)**2
         return w_diff
 
-    def forward(self, x, return_stiff=False):
-        '''
-            x should have shape of N * 3
-        '''
-        x = x.unsqueeze(-1)
-        out_x = torch.matmul(self.A, x)
+    def forward(self, vertices: torch.Tensor):
+        vertices = vertices.unsqueeze(-1)
+        out_x = torch.matmul(self.A, vertices)
         out_x = out_x + self.b
-        out_x.squeeze_(-1)
-        if return_stiff:
-            stiffness = self.stiffness()
-            return out_x, stiffness
-        else:
-            return out_x
-
-
-if __name__ == "__main__":
-    # Test the LocalAffine module
-    num_points = 10
-    edges = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6],
-                          [6, 7], [7, 8], [8, 9], [9, 0]])
-    x = torch.randn(num_points, 3)
-    local_affine = AffineTransformLocal(num_points, edges)
-    out_x, stiffness = local_affine(x, return_stiff=True)
-    print(out_x.shape, stiffness.shape, local_affine.A.shape)
-    print(out_x)
-    print(stiffness)
-    print(local_affine.A)
+        return out_x.squeeze(-1)

@@ -4,7 +4,7 @@ import open3d as o3d
 from typing import Union
 from copy import deepcopy
 
-from non_rigid_icp.Method.pcd import toPointCloud
+from non_rigid_icp.Method.trans import toPointCloud, toMesh
 
 def toPaintedMesh(
     mesh: o3d.geometry.TriangleMesh,
@@ -86,6 +86,18 @@ def renderGeometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=600
     img_np = np.asarray(img)  # 转换为 numpy 数组
     return img_np
 
-def renderPoints(points: Union[torch.Tensor, np.ndarray], phi=45, theta=30, radius=3.0, width=800, height=600):
-    pcd = toPointCloud(points)
-    return renderGeometry(pcd, phi, theta, radius, width, height)
+def renderPoints(
+    points: Union[torch.Tensor, np.ndarray],
+    triangles: Union[np.ndarray, None]=None,
+    phi=45,
+    theta=30,
+    radius=3.0,
+    width=800,
+    height=600,
+):
+    if triangles is None:
+        geometry = toPointCloud(points)
+    else:
+        geometry = toMesh(points, triangles)
+        geometry.compute_vertex_normals()
+    return renderGeometry(geometry, phi, theta, radius, width, height)
