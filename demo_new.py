@@ -4,7 +4,7 @@ import numpy as np
 import open3d as o3d
 from copy import deepcopy
 
-from non_rigid_icp.Method.trans import toNormalizeTransform, transMesh
+from non_rigid_icp.Method.trans import toNormalizeTransform, transGeometry
 from non_rigid_icp.Method.registration import registration_mesh2mesh
 
 def pose_registration(
@@ -21,8 +21,8 @@ def pose_registration(
     template_center, template_scale = toNormalizeTransform(template_points)
     target_center, target_scale = toNormalizeTransform(target_points)
 
-    transMesh(template_mesh, template_center, template_scale)
-    transMesh(target_mesh, target_center, target_scale)
+    transGeometry(template_mesh, template_center, template_scale)
+    transGeometry(target_mesh, target_center, target_scale)
 
     template_mesh.compute_vertex_normals()
     target_mesh.compute_vertex_normals()
@@ -33,7 +33,7 @@ def pose_registration(
     assert isinstance(registered_mesh, o3d.geometry.TriangleMesh)
 
     registered_mesh = deepcopy(template_mesh)
-    transMesh(registered_mesh, target_center, target_scale, True)
+    transGeometry(registered_mesh, target_center, target_scale, True)
 
     registered_mesh.compute_vertex_normals()
 

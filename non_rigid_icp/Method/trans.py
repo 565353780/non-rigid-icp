@@ -2,14 +2,22 @@ import torch
 import trimesh
 import numpy as np
 import open3d as o3d
-from typing import Tuple
+from typing import Tuple, Union
 
 
-def toTensor(array: np.ndarray, device: str = 'cpu', dtype = torch.float32) -> torch.Tensor:
-    return torch.tensor(np.asarray(array)).to(device, dtype=dtype)
+def toTensor(array: Union[np.ndarray, torch.Tensor], device: str = 'cpu', dtype = torch.float32) -> torch.Tensor:
+    if isinstance(array, np.ndarray):
+        tensor = torch.tensor(np.asarray(array))
+    else:
+        tensor = array
+    return tensor.to(device, dtype=dtype)
 
-def toNumpy(tensor: torch.Tensor, dtype = np.float32) -> np.ndarray:
-    return tensor.detach().cpu().numpy().astype(dtype)
+def toNumpy(tensor: Union[torch.Tensor, np.ndarray], dtype = np.float32) -> np.ndarray:
+    if isinstance(tensor, torch.Tensor):
+        array = tensor.detach().cpu().numpy()
+    else:
+        array = tensor
+    return array.astype(dtype)
 
 def toO3DMesh(tri_mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     o3d_mesh = o3d.geometry.TriangleMesh()
@@ -28,6 +36,22 @@ def toNormalizeTransform(
     scale = 0.9 / length
     return center, scale
 
+def transPcd(
+    pcd: o3d.geometry.PointCloud,
+    center: np.ndarray,
+    scale: float,
+    is_inverse: bool = False,
+) -> bool:
+    points = np.asarray(pcd.points)
+
+    if is_inverse:
+        points = points / scale + center
+    else:
+        points = (points - center) * scale
+
+    pcd.points = o3d.utility.Vector3dVector(points)
+    return True
+
 def transMesh(
     mesh: o3d.geometry.TriangleMesh,
     center: np.ndarray,
@@ -43,3 +67,18 @@ def transMesh(
 
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     return True
+
+def transGeometry(
+    geometry: Union[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud],
+    center: np.ndarray,
+    scale: float,
+    is_inverse: bool = False,
+) -> bool:
+    if isinstance(geometry, o3d.geometry.PointCloud):
+        return transPcd(geometry, center, scale, is_inverse)
+    elif isinstance(geometry, o3d.geometry.TriangleMesh):
+        return transMesh(geometry, center, scale, is_inverse)
+    else:
+        print('[ERROR][trans::transGeometry]')
+        print('\t geometry type not valid!')
+        return False

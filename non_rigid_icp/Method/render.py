@@ -1,7 +1,10 @@
+import torch
 import numpy as np
 import open3d as o3d
 from typing import Union
 from copy import deepcopy
+
+from non_rigid_icp.Method.pcd import toPointCloud
 
 def toPaintedMesh(
     mesh: o3d.geometry.TriangleMesh,
@@ -25,7 +28,7 @@ def renderColoredMeshes(
     o3d.visualization.draw_geometries(painted_mesh_list)
     return True
 
-def spherical_to_cartesian(radius, phi, theta):
+def sphericalToCartesian(radius, phi, theta):
     """
     将球面坐标 (phi, theta) 转换为笛卡尔坐标 (x, y, z)
     :param radius: 相机到物体的距离
@@ -42,7 +45,7 @@ def spherical_to_cartesian(radius, phi, theta):
 
     return np.array([x, y, z])
 
-def render_geometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
+def renderGeometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
     """
     使用 Open3D 离屏渲染器渲染点云或三角网格，并返回图像数据 (numpy 数组格式)
 
@@ -71,7 +74,7 @@ def render_geometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=60
     render.scene.add_geometry("object", geometry, material)
 
     # 计算相机位置（球面坐标 -> 笛卡尔坐标）
-    eye = spherical_to_cartesian(radius, phi, theta)
+    eye = sphericalToCartesian(radius, phi, theta)
     center = np.array([0, 0, 0])  # 物体始终位于原点
     up = np.array([0, 1, 0])  # 设定 Z 轴向上
 
@@ -82,3 +85,7 @@ def render_geometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=60
     img = render.render_to_image()
     img_np = np.asarray(img)  # 转换为 numpy 数组
     return img_np
+
+def renderPoints(points: Union[torch.Tensor, np.ndarray], phi=45, theta=30, radius=3.0, width=800, height=600):
+    pcd = toPointCloud(points)
+    return renderGeometry(pcd, phi, theta, radius, width, height)

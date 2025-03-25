@@ -1,14 +1,14 @@
 import torch
 import numpy as np
 import open3d as o3d
-from tqdm import tqdm
+from tqdm import trange
 from copy import deepcopy
 
 from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.time import getCurrentTime
 from non_rigid_icp.Method.render import render_geometry
-from non_rigid_icp.Method.trans import toTensor, toNumpy, transMesh
+from non_rigid_icp.Method.trans import toTensor, toNumpy
 from non_rigid_icp.Method.utils import convert_mesh_to_pcl, laplacian_smoothing
 from non_rigid_icp.Model.local_affine import AffineTransformLocal
 from non_rigid_icp.Metric.chamfer import toL1ChamferDistance
@@ -49,7 +49,7 @@ def registration_mesh2pcl(
     chamLoss = chamfer_3DDist()
     logger = Logger(log_folder_path)
 
-    loop = tqdm(range(outer_iter))
+    loop = trange(outer_iter)
     w_idx = 0
 
     phi = 30   # 水平旋转角度（绕 Z 轴）
