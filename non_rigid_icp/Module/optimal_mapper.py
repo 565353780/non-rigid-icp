@@ -114,6 +114,8 @@ class OptimalMapper(object):
         self.gt_center, self.gt_scale = toNormalizeTransform(self.gt_points)
 
         transGeometry(self.gt_geometry, self.gt_center, self.gt_scale)
+        if isinstance(self.gt_geometry, o3d.geometry.TriangleMesh):
+            self.gt_geometry.compute_vertex_normals()
 
         if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
             self.gt_points = np.asarray(self.gt_geometry.points)
@@ -216,8 +218,9 @@ class OptimalMapper(object):
 
         self.updateTemplateVertices(template_mesh.vertices)
 
-        image = renderGeometry(
-            template_mesh,
+        image = renderPoints(
+            self.template_vertices,
+            self.template_triangles,
             phi=self.phi,
             theta=self.theta,
             radius=self.radius)
