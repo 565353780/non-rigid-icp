@@ -5,11 +5,16 @@ from tqdm import tqdm
 from copy import deepcopy
 
 from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
-
 from non_rigid_icp.Method.icp import icp
-from non_rigid_icp.Method.trans import toTensor, toNumpy
+from non_rigid_icp.Method.time import getCurrentTime
+from non_rigid_icp.Method.render import render_geometry
+from non_rigid_icp.Method.trans import toTensor, toNumpy, transMesh
 from non_rigid_icp.Method.utils import convert_mesh_to_pcl, laplacian_smoothing
 from non_rigid_icp.Model.local_affine import AffineTransformLocal
+from non_rigid_icp.Metric.chamfer import toL1ChamferDistance
+from non_rigid_icp.Module.logger import Logger
+from non_rigid_icp.Module.timer import Timer
+
 
 
 def registration_mesh2pcl(
@@ -21,7 +26,6 @@ def registration_mesh2pcl(
     stiffness_weights: list = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2],
     laplacian_weight: float = 250,
     out_affine=False,
-    in_affine=None,
     device: str='cpu',
 ) -> bool:
     """
@@ -40,15 +44,29 @@ def registration_mesh2pcl(
     Returns:
     - o3d.geometry.TriangleMesh: The aligned source mesh after applying the non-rigid ICP algorithm.
     """
+    log_folder_path = './logs/' + getCurrentTime() + '/'
+
     chamLoss = chamfer_3DDist()
+    logger = Logger(log_folder_path)
 
     loop = tqdm(range(outer_iter))
     w_idx = 0
+
+    phi = 30   # 水平旋转角度（绕 Z 轴）
+    theta = 10  # 垂直仰角（相机高度）
+    radius = 1.0  # 相机到物体的距离
+
+    image = render_geometry(target_pcl, phi=phi, theta=theta, radius=radius)
+    logger.addImage('GT', image, 0)
 
     transformation = icp(template_mesh, target_pcl)
     assert transformation is not None
 
     transformed_mesh = deepcopy(template_mesh).transform(transformation)
+
+    image = render_geometry(transformed_mesh, phi=phi, theta=theta, radius=radius)
+    logger.addImage('ICP', image, 0)
+
     transformed_vertex = toTensor(transformed_mesh.vertices, device)
 
     template_vertex = toTensor(template_mesh.vertices, device)
@@ -66,11 +84,8 @@ def registration_mesh2pcl(
 
     template_edges = toTensor(edges, device, torch.long)
 
-    if in_affine is None:
-        local_affine_model = AffineTransformLocal(template_vertex.shape[0],
-                                                  template_edges).to(device)
-    else:
-        local_affine_model = in_affine
+    local_affine_model = AffineTransformLocal(
+        template_vertex.shape[0], template_edges).to(device)
 
     # define optimizer
     optimizer = torch.optim.AdamW([{
@@ -79,6 +94,7 @@ def registration_mesh2pcl(
                                   lr=1e-4,
                                   amsgrad=True)
 
+    step = 0
     for i in loop:
         # just uses linear transformation based on learned parameters and also uses stiffness term
         new_deformed_verts, stiffness = local_affine_model(
@@ -86,7 +102,7 @@ def registration_mesh2pcl(
 
         dist1, dist2, idx1, idx2 = chamLoss(new_deformed_verts.unsqueeze(0), target_vertex)
 
-        if (i == 0) and (in_affine is None):
+        if i == 0:
             inner_loop = range(4)
         else:
             inner_loop = range(inner_iter)
@@ -136,8 +152,20 @@ def registration_mesh2pcl(
                 toNumpy(new_deformed_verts, np.float64))
             new_deformed_mesh = template_mesh
 
+            logger.addScalar('Loss/Stiffness', stiffness_sum.item(), step)
+            logger.addScalar('Loss/MatchingDist', vert_sum.item(), step)
+            logger.addScalar('Loss/Laplacian', laplacian_loss.item(), step)
+
+            step += 1
+
+        l1_chamfer = toL1ChamferDistance(dist1, dist2)
+        logger.addScalar('Metric/L1-Chamfer', l1_chamfer, step)
+
+        image = render_geometry(template_mesh, phi=phi, theta=theta, radius=radius)
+        logger.addImage('DeformedMesh', image, step)
+
         # final loss calculation in outer loop
-        print(stiffness_sum.item(), vert_sum.item(), laplacian_loss.item())
+        print(l1_chamfer, stiffness_sum.item(), vert_sum.item(), laplacian_loss.item())
 
         if i in milestones:
             w_idx += 1
