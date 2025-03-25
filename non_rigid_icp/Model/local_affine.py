@@ -10,7 +10,7 @@ class AffineTransformLocal(nn.Module):
     The module includes stiffness term to ensure that the close points have similar transformation.
     """
 
-    def __init__(self, num_points, edges=None):
+    def __init__(self, num_points: int, edges: torch.Tensor):
         """
         Initializes the LocalAffine module with the specified number of points and batch size.
         """
@@ -24,8 +24,6 @@ class AffineTransformLocal(nn.Module):
         return
 
     def stiffness(self):
-        if self.edges is None:
-            raise Exception("No edges provided")
         idx1 = self.edges[:, 0]
         idx2 = self.edges[:, 1]
         affine_weight = torch.cat((self.A, self.b), dim=2)  # N * 3 * 4
