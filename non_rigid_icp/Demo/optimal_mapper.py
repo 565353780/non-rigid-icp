@@ -10,7 +10,7 @@ def demo():
     milestones = [50, 80, 100, 110, 120, 130, 140]
     stiffness_weights = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2]
     laplacian_weight = 1.0
-    device = 'cuda'
+    device = 'cpu'
     save_result_folder_path = 'auto'
     save_log_folder_path = 'auto'
     render = True

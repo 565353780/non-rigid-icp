@@ -6,7 +6,11 @@ import open3d as o3d
 from tqdm import trange
 from typing import Union
 
-from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
+if torch.cuda.is_available():
+    from non_rigid_icp.Lib.chamfer3D.dist_chamfer_3D import chamfer_3DDist
+else:
+    from non_rigid_icp.Lib.chamfer3D.chamfer_python import distChamfer
+
 from non_rigid_icp.Loss.masked_dist import toMaskedDistLoss
 from non_rigid_icp.Loss.laplacian import toLaplacian, toLaplacianLoss
 from non_rigid_icp.Method.icp import icp
@@ -48,7 +52,10 @@ class OptimalMapper(object):
 
         self.logger = Logger()
 
-        self.chamfer_func = chamfer_3DDist()
+        if torch.cuda.is_available():
+            self.chamfer_func = chamfer_3DDist()
+        else:
+            self.chamfer_func = distChamfer
 
         self.initRecords()
 
