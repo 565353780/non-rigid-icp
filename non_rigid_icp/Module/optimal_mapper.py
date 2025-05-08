@@ -52,7 +52,7 @@ class OptimalMapper(object):
 
         self.logger = Logger()
 
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and device != 'cpu':
             self.chamfer_func = chamfer_3DDist()
         else:
             self.chamfer_func = distChamfer
@@ -269,6 +269,8 @@ class OptimalMapper(object):
 
         deform_model = DeformModel(
             self.template_vertices.shape[0], self.template_triangles, self.device)
+
+        deform_model.setDeformGradState(True)
 
         optimizer = torch.optim.AdamW([
             deform_model.deform_field.rotate_matrixs,
