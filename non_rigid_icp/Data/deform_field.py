@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from torch import nn
+from typing import Union
 
 from non_rigid_icp.Method.trans import toNumpy, toTensor
 
@@ -10,7 +11,10 @@ class DeformField(object):
         self,
         vertex_num: int,
         triangles: torch.Tensor,
+        device: str = 'cpu',
     ) -> None:
+        self.device = device
+
         triangles = toNumpy(triangles)
 
         edges = np.vstack(
@@ -18,11 +22,12 @@ class DeformField(object):
         edges = np.sort(edges, axis=1)
         edges = np.unique(edges, axis=0)
 
-        edges = toTensor(edges, dtype=torch.int64)
-        self.register_buffer("edges", edges)
+        # Data
+        self.edges = toTensor(edges, self.device, torch.int64)
 
-        self.rotate_matrixs = torch.eye(3).reshape(1, 3, 3).repeat(vertex_num, 1, 1)  # N * 3 * 3
-        self.translates = torch.zeros(3).reshape(1, 3, 1).repeat(vertex_num, 1, 1)  # N * 3 * 1
+        # Diff Params
+        self.rotate_matrixs = torch.eye(3).reshape(1, 3, 3).repeat(vertex_num, 1, 1).to(self.device)  # N * 3 * 3
+        self.translates = torch.zeros(3).reshape(1, 3, 1).repeat(vertex_num, 1, 1).to(self.device)  # N * 3 * 1
         return
 
     def setGradState(self, need_grad: bool, vertex_mask: Union[torch.Tensor, None] = None) -> bool:

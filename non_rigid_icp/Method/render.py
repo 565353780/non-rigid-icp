@@ -1,4 +1,5 @@
 import torch
+import platform
 import numpy as np
 import open3d as o3d
 from typing import Union
@@ -58,6 +59,38 @@ def sphericalToCartesian(radius, phi, theta):
 
     return np.array([x, y, z])
 
+def renderGeometryOnScreen(geometry, phi=45, theta=30, radius=3.0, width=800, height=600, window_name="OnScreenRender"):
+    """
+    使用 Open3D 的窗口渲染器渲染点云或三角网格，并返回窗口截图的图像数据 (numpy 数组格式)
+
+    :param geometry: Open3D 点云 (o3d.geometry.PointCloud) 或 三角网格 (o3d.geometry.TriangleMesh)
+    :param phi: 方位角 (0-360°)，决定相机在 xy 平面上的旋转角度
+    :param theta: 极角 (0-180°)，决定相机在 z 轴上的仰角
+    :param radius: 相机到物体的距离
+    :param width: 渲染图像宽度
+    :param height: 渲染图像高度
+    :param window_name: 窗口名称
+    :return: 渲染后的 RGB 图像 (numpy 数组格式)
+    """
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=window_name, width=width, height=height, visible=True)
+    vis.add_geometry(geometry)
+    ctr = vis.get_view_control()
+    # 计算相机位置
+    eye = sphericalToCartesian(radius, phi, theta)
+    center = np.array([0, 0, 0])
+    up = np.array([0, 1, 0])
+    ctr.set_lookat(center)
+    ctr.set_front((center - eye) / np.linalg.norm(center - eye))
+    ctr.set_up(up)
+    ctr.set_zoom(0.7)
+    vis.poll_events()
+    vis.update_renderer()
+    img = vis.capture_screen_float_buffer(False)
+    vis.destroy_window()
+    img_np = (np.asarray(img) * 255).astype(np.uint8)
+    return img_np
+
 def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
     """
     使用 Open3D 离屏渲染器渲染点云或三角网格，并返回图像数据 (numpy 数组格式)
@@ -99,7 +132,14 @@ def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, h
     img_np = np.asarray(img)  # 转换为 numpy 数组
     return img_np
 
-def renderPointsOffScreen(
+def renderGeometryImage(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
+    system = platform.system().lower()
+    if system == "linux":
+        return renderGeometryOffScreen(geometry, phi, theta, radius, width, height)
+    else:
+        return renderGeometryOnScreen(geometry, phi, theta, radius, width, height)
+
+def renderPointsImage(
     points: Union[torch.Tensor, np.ndarray],
     triangles: Union[np.ndarray, None]=None,
     phi=45,
@@ -113,4 +153,4 @@ def renderPointsOffScreen(
     else:
         geometry = toMesh(points, triangles)
         geometry.compute_vertex_normals()
-    return renderGeometryOffScreen(geometry, phi, theta, radius, width, height)
+    return renderGeometryImage(geometry, phi, theta, radius, width, height)

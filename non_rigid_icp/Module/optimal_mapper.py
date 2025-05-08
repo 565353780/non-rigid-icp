@@ -16,10 +16,10 @@ from non_rigid_icp.Loss.laplacian import toLaplacian, toLaplacianLoss
 from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
-from non_rigid_icp.Method.render import renderGeometry, renderPoints
+from non_rigid_icp.Method.render import renderGeometryImage, renderPointsImage
 from non_rigid_icp.Method.trans import toMesh, toNormalizeTransform, toTensor, transGeometry, transPoints
 from non_rigid_icp.Method.video import toVideo
-from non_rigid_icp.Model.local_affine import AffineTransformLocal
+from non_rigid_icp.Model.deform import DeformModel
 from non_rigid_icp.Metric.chamfer import toL1ChamferDistance
 from non_rigid_icp.Module.logger import Logger
 
@@ -140,7 +140,7 @@ class OptimalMapper(object):
         self.gt_points = toTensor(self.gt_points, self.device).unsqueeze(0)
 
         if self.render:
-            image = renderGeometry(
+            image = renderGeometryImage(
                 self.gt_geometry,
                 phi=self.phi,
                 theta=self.theta,
@@ -164,7 +164,7 @@ class OptimalMapper(object):
         self.template_triangles = toTensor(self.template_triangles, self.device, torch.int64)
 
         if self.render:
-            image = renderPoints(
+            image = renderPointsImage(
                 self.template_vertices,
                 self.template_triangles,
                 phi=self.phi,
@@ -240,7 +240,7 @@ class OptimalMapper(object):
         self.updateTemplateVertices(template_mesh.vertices)
 
         if self.render:
-            image = renderPoints(
+            image = renderPointsImage(
                 self.template_vertices,
                 self.template_triangles,
                 phi=self.phi,
@@ -267,17 +267,18 @@ class OptimalMapper(object):
 
         source_laplacian = toLaplacian(self.template_vertices, self.template_triangles)
 
-        local_affine_model = AffineTransformLocal(
-            self.template_vertices.shape[0], self.template_triangles).to(self.device)
+        deform_model = DeformModel(
+            self.template_vertices.shape[0], self.template_triangles, self.device)
 
-        optimizer = torch.optim.AdamW([{
-            'params': local_affine_model.parameters()
-        }], lr=1e-4, amsgrad=True)
+        optimizer = torch.optim.AdamW([
+            deform_model.deform_field.rotate_matrixs,
+            deform_model.deform_field.translates,
+        ], lr=1e-4, amsgrad=True)
 
         step = 0
         for i in loop:
-            new_deformed_verts = local_affine_model(self.template_vertices)
-            stiffness = local_affine_model.stiffness()
+            new_deformed_verts = deform_model.deform(self.template_vertices)
+            stiffness = deform_model.deform_field.stiffness()
 
             idx1 = self.chamfer_func(new_deformed_verts.unsqueeze(0), self.gt_points)[2]
 
@@ -291,8 +292,8 @@ class OptimalMapper(object):
             for _ in inner_loop:
                 optimizer.zero_grad()
 
-                new_deformed_verts = local_affine_model(self.template_vertices)
-                stiffness = local_affine_model.stiffness()
+                new_deformed_verts = deform_model.deform(self.template_vertices)
+                stiffness = deform_model.deform_field.stiffness()
 
                 masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points)
 
@@ -318,8 +319,8 @@ class OptimalMapper(object):
             self.logger.addScalar('Metric/L1-Chamfer', l1_chamfer, step)
 
             if self.render:
-                new_deformed_verts = local_affine_model(self.template_vertices)
-                image = renderPoints(
+                new_deformed_verts = deform_model.deform(self.template_vertices)
+                image = renderPointsImage(
                     new_deformed_verts,
                     self.template_triangles,
                     phi=self.phi,
@@ -336,7 +337,7 @@ class OptimalMapper(object):
             if i in self.milestones:
                 w_idx += 1
 
-        new_deformed_verts = local_affine_model(self.template_vertices)
+        new_deformed_verts = deform_model.deform(self.template_vertices)
         self.updateTemplateVertices(new_deformed_verts)
 
         if self.render:
