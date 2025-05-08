@@ -6,6 +6,19 @@ from copy import deepcopy
 
 from non_rigid_icp.Method.trans import toPointCloud, toMesh
 
+
+def renderGeometries(geometry_list, window_name="Geometry List", point_show_normal: bool = False):
+    if not isinstance(geometry_list, list):
+        geometry_list = [geometry_list]
+
+    o3d.visualization.draw_geometries(geometry_list, window_name, point_show_normal=point_show_normal)
+    return True
+
+def renderPoints(points: np.ndarray, window_name="Points", point_show_normal: bool = False):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    return renderGeometries(pcd, window_name, point_show_normal)
+
 def toPaintedMesh(
     mesh: o3d.geometry.TriangleMesh,
     color: Union[np.ndarray, list] = [0.1, 0.1, 0.9],
@@ -45,7 +58,7 @@ def sphericalToCartesian(radius, phi, theta):
 
     return np.array([x, y, z])
 
-def renderGeometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
+def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
     """
     使用 Open3D 离屏渲染器渲染点云或三角网格，并返回图像数据 (numpy 数组格式)
 
@@ -86,7 +99,7 @@ def renderGeometry(geometry, phi=45, theta=30, radius=3.0, width=800, height=600
     img_np = np.asarray(img)  # 转换为 numpy 数组
     return img_np
 
-def renderPoints(
+def renderPointsOffScreen(
     points: Union[torch.Tensor, np.ndarray],
     triangles: Union[np.ndarray, None]=None,
     phi=45,
@@ -100,4 +113,4 @@ def renderPoints(
     else:
         geometry = toMesh(points, triangles)
         geometry.compute_vertex_normals()
-    return renderGeometry(geometry, phi, theta, radius, width, height)
+    return renderGeometryOffScreen(geometry, phi, theta, radius, width, height)
