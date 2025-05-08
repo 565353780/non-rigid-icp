@@ -3,10 +3,9 @@ import torch
 import trimesh
 import numpy as np
 import open3d as o3d
-from typing import Union, Tuple
 from copy import deepcopy
+from typing import Union, Tuple
 
-from non_rigid_icp.Method.trans import toNumpy
 from non_rigid_icp.Method.io import loadMeshFile
 from non_rigid_icp.Method.path import createFileFolder, removeFile, renameFile
 from non_rigid_icp.Method.render import renderGeometries
@@ -79,12 +78,12 @@ class Mesh(object):
 
         return True
 
-    def center(self) -> Point:
+    def center(self) -> np.ndarray:
         min_bound = np.min(self.vertices, axis=0)
         max_bound = np.max(self.vertices, axis=0)
 
         center = (min_bound + max_bound) / 2.0
-        return Point.from_numpy(center)
+        return center
 
     def length(self) -> float:
         min_bound = np.min(self.vertices, axis=0)
@@ -93,9 +92,8 @@ class Mesh(object):
         return length
 
     def normalize(self) -> bool:
-        center = self.center().numpy()
         scale = 0.9 / self.length()
-        self.vertices = (self.vertices - center) * scale
+        self.vertices = (self.vertices - self.center()) * scale
         return True
 
     def toO3DMesh(self) -> o3d.geometry.TriangleMesh:

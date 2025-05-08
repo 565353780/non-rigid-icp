@@ -3,24 +3,26 @@ import numpy as np
 from torch import nn
 from typing import Union
 
+from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Method.trans import toNumpy, toTensor
 
 
 class DeformField(object):
     def __init__(
         self,
-        vertex_num: int,
-        triangles: torch.Tensor,
+        mesh: Mesh,
         device: str = 'cpu',
     ) -> None:
         self.device = device
 
-        triangles = toNumpy(triangles)
+        triangles = mesh.triangles
 
         edges = np.vstack(
             [triangles[:, :2], triangles[:, 1:3], triangles[:, [0, 2]]])
         edges = np.sort(edges, axis=1)
         edges = np.unique(edges, axis=0)
+
+        vertex_num = mesh.vertices.shape[0]
 
         # Data
         self.edges = toTensor(edges, self.device, torch.int64)

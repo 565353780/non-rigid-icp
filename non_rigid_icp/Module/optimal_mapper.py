@@ -11,9 +11,11 @@ if torch.cuda.is_available():
 else:
     from non_rigid_icp.Lib.chamfer3D.chamfer_python import distChamfer
 
+from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Loss.masked_dist import toMaskedDistLoss
 from non_rigid_icp.Loss.laplacian import toLaplacian, toLaplacianLoss
 from non_rigid_icp.Method.icp import icp
+from non_rigid_icp.Method.trans import toNumpy
 from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
 from non_rigid_icp.Method.render import renderGeometryImage, renderPointsImage
@@ -68,8 +70,7 @@ class OptimalMapper(object):
         self.gt_center = None
         self.gt_scale = None
 
-        self.template_vertices = None
-        self.template_triangles = None
+        self.template_mesh = Mesh()
 
         # tmp
         self.save_deform_image_idx = 0
@@ -84,14 +85,9 @@ class OptimalMapper(object):
         return True
 
     def isTemplateValid(self) -> bool:
-        if self.template_vertices is None:
+        if not self.template_mesh.isValid():
             print('[ERROR][OptimalMapper::isTemplateValid]')
-            print('\t template vertices not exist! please load template mesh first!')
-            return False
-
-        if self.template_triangles is None:
-            print('[ERROR][OptimalMapper::isTemplateValid]')
-            print('\t template triangles not exist! please load template mesh first!')
+            print('\t isValid failed for template mesh! please load template mesh first!')
             return False
 
         return True
@@ -156,17 +152,11 @@ class OptimalMapper(object):
             print('\t isTemplateValid failed!')
             return False
 
-        template_center, template_scale = toNormalizeTransform(self.template_vertices)
-
-        self.template_vertices = transPoints(self.template_vertices, template_center, template_scale)
-
-        self.template_vertices = toTensor(self.template_vertices, self.device)
-        self.template_triangles = toTensor(self.template_triangles, self.device, torch.int64)
+        self.template_mesh.normalize()
 
         if self.render:
-            image = renderPointsImage(
-                self.template_vertices,
-                self.template_triangles,
+            image = renderGeometryImage(
+                self.template_mesh.toO3DMesh(),
                 phi=self.phi,
                 theta=self.theta,
                 radius=self.radius)
@@ -203,12 +193,6 @@ class OptimalMapper(object):
         gt_mesh = o3d.io.read_triangle_mesh(gt_mesh_file_path)
         return self.loadGTMesh(gt_mesh)
 
-    def loadTemplateMesh(self, template_mesh: o3d.geometry.TriangleMesh) -> bool:
-        self.template_vertices = np.asarray(template_mesh.vertices)
-        self.template_triangles = np.asarray(template_mesh.triangles)
-        self.normalizeTemplateMesh()
-        return True
-
     def loadTemplateMeshFile(self, template_mesh_file_path: str) -> bool:
         if not os.path.exists(template_mesh_file_path):
             print('[ERROR][OptimalMapper::loadTemplateMeshFile]')
@@ -216,11 +200,12 @@ class OptimalMapper(object):
             print('\t template_mesh_file_path:', template_mesh_file_path)
             return False
 
-        template_mesh = o3d.io.read_triangle_mesh(template_mesh_file_path)
-        return self.loadTemplateMesh(template_mesh)
+        self.template_mesh.loadMesh(template_mesh_file_path)
+        self.normalizeTemplateMesh()
+        return True
 
     def updateTemplateVertices(self, new_vertices: Union[torch.Tensor, np.ndarray]) -> bool:
-        self.template_vertices = toTensor(new_vertices, self.device)
+        self.template_mesh.vertices = toNumpy(new_vertices, np.float32)
         return True
 
     def estimateInitPose(
@@ -231,7 +216,7 @@ class OptimalMapper(object):
             print('\t isValid failed!')
             return False
 
-        template_mesh = toMesh(self.template_vertices, self.template_triangles)
+        template_mesh = self.template_mesh.toO3DMesh()
         transformation = icp(template_mesh, self.gt_geometry)
         assert transformation is not None
 
@@ -240,9 +225,8 @@ class OptimalMapper(object):
         self.updateTemplateVertices(template_mesh.vertices)
 
         if self.render:
-            image = renderPointsImage(
-                self.template_vertices,
-                self.template_triangles,
+            image = renderGeometryImage(
+                self.template_mesh.toO3DMesh(),
                 phi=self.phi,
                 theta=self.theta,
                 radius=self.radius)
@@ -265,11 +249,14 @@ class OptimalMapper(object):
         loop = trange(self.outer_iter)
         w_idx = 0
 
-        source_laplacian = toLaplacian(self.template_vertices, self.template_triangles)
+        template_triangles = toTensor(self.template_mesh.triangles, self.device, torch.int64)
 
-        deform_model = DeformModel(
-            self.template_vertices.shape[0], self.template_triangles, self.device)
+        source_laplacian = toLaplacian(
+            toTensor(self.template_mesh.vertices, self.device, torch.float32),
+            template_triangles
+        )
 
+        deform_model = DeformModel(self.template_mesh, self.device)
         deform_model.setDeformGradState(True)
 
         optimizer = torch.optim.AdamW([
@@ -279,8 +266,8 @@ class OptimalMapper(object):
 
         step = 0
         for i in loop:
-            new_deformed_verts = deform_model.deform(self.template_vertices)
-            stiffness = deform_model.deform_field.stiffness()
+            new_deformed_verts = deform_model.deform()
+            stiffness = deform_model.stiffness()
 
             idx1 = self.chamfer_func(new_deformed_verts.unsqueeze(0), self.gt_points)[2]
 
@@ -294,15 +281,15 @@ class OptimalMapper(object):
             for _ in inner_loop:
                 optimizer.zero_grad()
 
-                new_deformed_verts = deform_model.deform(self.template_vertices)
-                stiffness = deform_model.deform_field.stiffness()
+                new_deformed_verts = deform_model.deform()
+                stiffness = deform_model.stiffness()
 
                 masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points)
 
                 stiffness_loss = self.stiffness_weights[w_idx] * torch.sum(stiffness)
 
                 laplacian_loss = toLaplacianLoss(
-                    new_deformed_verts, self.template_triangles, source_laplacian)
+                    new_deformed_verts, template_triangles, source_laplacian)
 
                 laplacian_loss = self.laplacian_weight * laplacian_loss
 
@@ -321,10 +308,10 @@ class OptimalMapper(object):
             self.logger.addScalar('Metric/L1-Chamfer', l1_chamfer, step)
 
             if self.render:
-                new_deformed_verts = deform_model.deform(self.template_vertices)
+                new_deformed_verts = deform_model.deform()
                 image = renderPointsImage(
                     new_deformed_verts,
-                    self.template_triangles,
+                    template_triangles,
                     phi=self.phi,
                     theta=self.theta,
                     radius=self.radius
@@ -339,7 +326,7 @@ class OptimalMapper(object):
             if i in self.milestones:
                 w_idx += 1
 
-        new_deformed_verts = deform_model.deform(self.template_vertices)
+        new_deformed_verts = deform_model.deform()
         self.updateTemplateVertices(new_deformed_verts)
 
         if self.render:
@@ -351,7 +338,7 @@ class OptimalMapper(object):
         return True
 
     def toDeformedTemplateMesh(self) -> o3d.geometry.TriangleMesh:
-        deformed_template_mesh = toMesh(self.template_vertices, self.template_triangles)
+        deformed_template_mesh = self.template_mesh.toO3DMesh()
 
         transGeometry(
             deformed_template_mesh,
