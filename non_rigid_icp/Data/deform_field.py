@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torch import nn
-from typing import Union
+from typing import Union, Tuple
 
 from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Method.trans import toNumpy, toTensor
@@ -78,18 +78,24 @@ class DeformField(object):
         self.translates[vertex_mask].requires_grad_(need_grad)
         return True
 
-    def stiffness(self):
+    def stiffness(self) -> Tuple[torch.Tensor, torch.Tensor]:
         idx1 = self.diff_group_edges[:, 0]
         idx2 = self.diff_group_edges[:, 1]
 
         compact_idx1 = self.compact_vertex_group_idxs[idx1]
         compact_idx2 = self.compact_vertex_group_idxs[idx2]
 
-        affine_weight = torch.cat((self.rotate_matrixs, self.translates), dim=2)  # N * 3 * 4
-        w1 = torch.index_select(affine_weight, dim=0, index=compact_idx1)
-        w2 = torch.index_select(affine_weight, dim=0, index=compact_idx2)
-        w_diff = (w1 - w2)**2
-        return w_diff
+        r1 = torch.index_select(self.rotate_matrixs, dim=0, index=compact_idx1)
+        r2 = torch.index_select(self.rotate_matrixs, dim=0, index=compact_idx2)
+        r_diff = (r1 - r2) ** 2
+        rotate_stiffness = torch.sum(r_diff)
+
+        t1 = torch.index_select(self.translates, dim=0, index=compact_idx1)
+        t2 = torch.index_select(self.translates, dim=0, index=compact_idx2)
+        t_diff = (t1 - t2) ** 2
+        translate_stiffness = torch.sum(t_diff)
+
+        return rotate_stiffness, translate_stiffness
 
     def toRotateMatrixs(self) -> torch.Tensor:
         return self.rotate_matrixs[self.compact_vertex_group_idxs]

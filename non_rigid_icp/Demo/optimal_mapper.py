@@ -1,4 +1,7 @@
+import numpy as np
+
 from non_rigid_icp.Module.optimal_mapper import OptimalMapper
+
 
 data_dict = {
     'test': [
@@ -20,9 +23,11 @@ def demo():
 
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
     inner_iter = 50
-    outer_iter = 200
-    milestones = [50, 80, 100, 110, 120, 130, 140, 150]
-    stiffness_weights = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2, 0]
+    outer_iter = 300
+    milestones = np.arange(10, outer_iter, 4)
+    masked_dist_thresh = float('inf')
+    masked_dist_weight = 1.0
+    stiffness_weights = 64 * 0.8 ** np.arange(milestones.shape[0] + 1)
     laplacian_weight = 1.0
     device = 'cuda'
     save_result_folder_path = 'auto'
@@ -33,6 +38,8 @@ def demo():
         inner_iter,
         outer_iter,
         milestones,
+        masked_dist_thresh,
+        masked_dist_weight,
         stiffness_weights,
         laplacian_weight,
         device,

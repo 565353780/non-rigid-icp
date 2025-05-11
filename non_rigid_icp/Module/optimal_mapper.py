@@ -30,10 +30,12 @@ class OptimalMapper(object):
     def __init__(
         self,
         inner_iter: int = 50,
-        outer_iter: int = 100,
-        milestones: list = [50, 80, 100, 110, 120, 130, 140],
-        stiffness_weights: list = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2],
-        laplacian_weight: float = 0.0,
+        outer_iter: int = 200,
+        milestones: list = [50, 80, 100, 110, 120, 130, 140, 150],
+        masked_dist_thresh: float = 0.04,
+        masked_dist_weight: float = 1.0,
+        stiffness_weights: list = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2, 0],
+        laplacian_weight: float = 1.0,
         device: str='cpu',
         save_result_folder_path: Union[str, None] = None,
         save_log_folder_path: Union[str, None] = None,
@@ -46,6 +48,8 @@ class OptimalMapper(object):
         self.outer_iter = outer_iter
         self.milestones = milestones
 
+        self.masked_dist_thresh = masked_dist_thresh
+        self.masked_dist_weight = masked_dist_weight
         self.stiffness_weights = stiffness_weights
         self.laplacian_weight = laplacian_weight
 
@@ -272,7 +276,6 @@ class OptimalMapper(object):
         step = 0
         for i in loop:
             new_deformed_verts = deform_model.deform()
-            stiffness = deform_model.stiffness()
 
             idx1 = self.chamfer_func(new_deformed_verts.unsqueeze(0), self.gt_points)[2]
 
@@ -287,15 +290,18 @@ class OptimalMapper(object):
                 optimizer.zero_grad()
 
                 new_deformed_verts = deform_model.deform()
-                stiffness = deform_model.stiffness()
 
-                masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points)
+                masked_dist_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
+                if self.masked_dist_weight > 0:
+                    masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points, self.masked_dist_thresh)
 
+                rotate_stiffness_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
+                translate_stiffness_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
                 stiffness_weight = self.stiffness_weights[w_idx]
-
-                stiffness_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
                 if stiffness_weight > 0:
-                    stiffness_loss = self.stiffness_weights[w_idx] * torch.sum(stiffness)
+                    rotate_stiffness, translate_stiffness = deform_model.stiffness()
+                    rotate_stiffness_loss = self.stiffness_weights[w_idx] * rotate_stiffness
+                    translate_stiffness_loss = self.stiffness_weights[w_idx] * translate_stiffness
 
                 laplacian_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
                 if self.laplacian_weight > 0:
@@ -305,13 +311,14 @@ class OptimalMapper(object):
                     laplacian_loss = self.laplacian_weight * laplacian_loss
 
                 # loss = torch.sqrt(masked_dist_loss + stiffness_loss) + laplacian_loss
-                loss = masked_dist_loss + stiffness_loss + laplacian_loss
+                loss = masked_dist_loss + rotate_stiffness_loss + translate_stiffness_loss + laplacian_loss
                 loss.backward()
                 optimizer.step()
 
                 deform_model.moveToLandMark()
 
-                self.logger.addScalar('Loss/Stiffness', stiffness_loss.item(), step)
+                self.logger.addScalar('Loss/RotateStiffness', rotate_stiffness_loss.item(), step)
+                self.logger.addScalar('Loss/TranslateStiffness', translate_stiffness_loss.item(), step)
                 self.logger.addScalar('Loss/MatchingDist', masked_dist_loss.item(), step)
                 self.logger.addScalar('Loss/Laplacian', laplacian_loss.item(), step)
 
@@ -334,7 +341,7 @@ class OptimalMapper(object):
                     cv2.imwrite(save_deformed_image_folder_path + str(self.save_deform_image_idx) + '.jpg', image)
                     self.save_deform_image_idx += 1
 
-            print(l1_chamfer, stiffness_loss.item(), masked_dist_loss.item(), laplacian_loss.item())
+            print(loss.item(), l1_chamfer)
 
             if i in self.milestones:
                 w_idx += 1
