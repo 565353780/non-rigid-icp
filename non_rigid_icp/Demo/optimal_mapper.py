@@ -1,10 +1,24 @@
 from non_rigid_icp.Module.optimal_mapper import OptimalMapper
 
+data_dict = {
+    'test': [
+        './data/source_test.obj',
+        './data/target_full.obj',
+    ],
+    'SMPL': [
+        './data/SMPL_male.ply',
+        './data/target.ply',
+    ],
+    'airplane_head': [
+        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/airplane_head_template.ply',
+        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/airplane_head_target.ply',
+    ],
+}
+
 def demo():
-    source_mesh_file_path = './data/source_test.obj'
-    target_mesh_file_path = './data/target_full.obj'
-    source_mesh_file_path = './data/SMPL_male.ply'
-    target_mesh_file_path = './data/target.ply'
+    data_id = 'airplane_head'
+
+    source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
     inner_iter = 50
     outer_iter = 100
     milestones = [50, 80, 100, 110, 120, 130, 140]
@@ -35,6 +49,6 @@ def demo():
 
     deformed_mesh = optimal_mapper.toDeformedTemplateMesh()
 
-    optimal_mapper.saveDeformedTemplateMesh('./output/optimal_mapper_mesh.ply')
+    optimal_mapper.saveDeformedTemplateMesh('./output/' + data_id + '/optimal_mapper_mesh.ply')
 
     print(deformed_mesh)

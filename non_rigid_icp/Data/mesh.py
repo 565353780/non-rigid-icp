@@ -6,7 +6,7 @@ import open3d as o3d
 from copy import deepcopy
 from typing import Union, Tuple
 
-from non_rigid_icp.Method.io import loadMeshFile
+from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes
 from non_rigid_icp.Method.path import createFileFolder, removeFile, renameFile
 from non_rigid_icp.Method.render import renderGeometries
 from non_rigid_icp.Module.timer import Timer
@@ -23,12 +23,20 @@ class Mesh(object):
         self.vertex_normals = None
         self.vertices = None
 
+        self.attributes = None
+
         if mesh_file_path is not None:
             self.loadMesh(mesh_file_path)
         return
 
     def reset(self):
-        self.mesh = None
+        self.triangle_normals = None
+        self.triangles = None
+        self.vertex_colors = None
+        self.vertex_normals = None
+        self.vertices = None
+
+        self.attributes = None
         return True
 
     @classmethod
@@ -55,7 +63,15 @@ class Mesh(object):
             print("\t loadMeshFile failed!")
             return False
 
-        return self.loadO3DMeshProperties(o3d_mesh)
+        if not self.loadO3DMeshProperties(o3d_mesh):
+            print('[ERROR][Mesh::loadMesh]')
+            print('\t loadO3DMeshProperties failed!')
+            return False
+
+        if mesh_file_path.endswith('.ply'):
+            self.attributes = loadPLYAttributes(mesh_file_path)
+
+        return True
 
     def isValid(self, output_info=False):
         if self.vertices is None:
