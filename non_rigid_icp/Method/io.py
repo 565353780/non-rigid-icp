@@ -23,7 +23,7 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
 
     Args:
         mesh_file_path: PLY文件路径
-    
+
     Returns:
         Tuple包含:
             - o3d.geometry.TriangleMesh: 加载的网格

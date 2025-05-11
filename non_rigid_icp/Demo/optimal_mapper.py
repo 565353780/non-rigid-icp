@@ -49,6 +49,6 @@ def demo():
 
     deformed_mesh = optimal_mapper.toDeformedTemplateMesh()
 
-    optimal_mapper.saveDeformedTemplateMesh('./output/' + data_id + '/optimal_mapper_mesh.ply')
+    optimal_mapper.saveDeformedTemplateMesh(optimal_mapper.save_result_folder_path + 'optimal_mapper_mesh.ply')
 
     print(deformed_mesh)
