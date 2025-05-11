@@ -6,7 +6,7 @@ import open3d as o3d
 from copy import deepcopy
 from typing import Union, Tuple
 
-from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes
+from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes, loadConstrains
 from non_rigid_icp.Method.path import createFileFolder, removeFile, renameFile
 from non_rigid_icp.Method.render import renderGeometries
 from non_rigid_icp.Module.timer import Timer
@@ -24,6 +24,7 @@ class Mesh(object):
         self.vertices = None
 
         self.attributes = None
+        self.constrains = {}
 
         if mesh_file_path is not None:
             self.loadMesh(mesh_file_path)
@@ -70,6 +71,7 @@ class Mesh(object):
 
         if mesh_file_path.endswith('.ply'):
             self.attributes = loadPLYAttributes(mesh_file_path)
+            self.constrains = loadConstrains(self.attributes)
 
         return True
 
@@ -111,6 +113,24 @@ class Mesh(object):
         scale = 0.9 / self.length()
         self.vertices = (self.vertices - self.center()) * scale
         return True
+
+    def transform(self, center: np.ndarray, scale: float, is_inverse: bool = False) -> bool:
+        if is_inverse:
+            self.vertices = self.vertices / scale + center
+        else:
+            self.vertices = (self.vertices - center) * scale
+
+        return True
+
+    def toO3DPcd(self) -> o3d.geometry.PointCloud:
+        o3d_pcd = o3d.geometry.PointCloud()
+        if self.vertex_colors is not None:
+            o3d_pcd.colors = o3d.utility.Vector3dVector(self.vertex_colors)
+        if self.vertex_normals is not None:
+            o3d_pcd.normals = o3d.utility.Vector3dVector(self.vertex_normals)
+        if self.vertices is not None:
+            o3d_pcd.points = o3d.utility.Vector3dVector(self.vertices)
+        return o3d_pcd
 
     def toO3DMesh(self) -> o3d.geometry.TriangleMesh:
         o3d_mesh = o3d.geometry.TriangleMesh()

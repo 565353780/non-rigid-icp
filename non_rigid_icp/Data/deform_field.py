@@ -81,9 +81,13 @@ class DeformField(object):
     def stiffness(self):
         idx1 = self.diff_group_edges[:, 0]
         idx2 = self.diff_group_edges[:, 1]
+
+        compact_idx1 = self.compact_vertex_group_idxs[idx1]
+        compact_idx2 = self.compact_vertex_group_idxs[idx2]
+
         affine_weight = torch.cat((self.rotate_matrixs, self.translates), dim=2)  # N * 3 * 4
-        w1 = torch.index_select(affine_weight, dim=0, index=idx1)
-        w2 = torch.index_select(affine_weight, dim=0, index=idx2)
+        w1 = torch.index_select(affine_weight, dim=0, index=compact_idx1)
+        w2 = torch.index_select(affine_weight, dim=0, index=compact_idx2)
         w_diff = (w1 - w2)**2
         return w_diff
 

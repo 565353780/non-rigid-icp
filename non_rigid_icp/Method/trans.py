@@ -97,6 +97,4 @@ def transGeometry(
     elif isinstance(geometry, o3d.geometry.TriangleMesh):
         return transMesh(geometry, center, scale, is_inverse)
     else:
-        print('[ERROR][trans::transGeometry]')
-        print('\t geometry type not valid!')
-        return False
+        return geometry.transform(center, scale, is_inverse)

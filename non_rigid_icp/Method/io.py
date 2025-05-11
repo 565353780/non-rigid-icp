@@ -133,3 +133,23 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
         # 即使解析额外属性失败，仍然返回基本网格
 
     return attributes
+
+def loadConstrains(attributes: dict) -> dict:
+    constrains = {}
+
+    for key, value in attributes.items():
+        if key == 'vertex_group':
+            group_idxs = value.astype(np.int64)
+
+            fixed_vertex_idxs = np.where(group_idxs == 2)[0]
+
+            fixed_target_position_idxs = np.where(group_idxs == 2)[0]
+
+            vertex_group_idxs = np.arange(0, group_idxs.shape[0], dtype=np.int64)
+            vertex_group_idxs[group_idxs == 1] = group_idxs.shape[0]
+
+            constrains['fixed_vertex_idxs'] = fixed_vertex_idxs
+            constrains['fixed_target_position_idxs'] = fixed_target_position_idxs
+            constrains['vertex_group_idxs'] = vertex_group_idxs
+
+    return constrains

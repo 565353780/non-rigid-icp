@@ -133,11 +133,16 @@ def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, h
     return img_np
 
 def renderGeometryImage(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
+    if isinstance(geometry, o3d.geometry.PointCloud) or isinstance(geometry, o3d.geometry.TriangleMesh):
+        render_geometry = geometry
+    else:
+        render_geometry = geometry.toO3DMesh()
+
     system = platform.system().lower()
     if system == "linux":
-        return renderGeometryOffScreen(geometry, phi, theta, radius, width, height)
+        return renderGeometryOffScreen(render_geometry, phi, theta, radius, width, height)
     else:
-        return renderGeometryOnScreen(geometry, phi, theta, radius, width, height)
+        return renderGeometryOnScreen(render_geometry, phi, theta, radius, width, height)
 
 def renderPointsImage(
     points: Union[torch.Tensor, np.ndarray],

@@ -61,8 +61,8 @@ class OptimalMapper(object):
 
         self.initRecords()
 
-        self.phi = 30
-        self.theta = 10
+        self.phi = 210
+        self.theta = 90
         self.radius = 1.0
 
         self.gt_points = None
@@ -118,13 +118,14 @@ class OptimalMapper(object):
             return False
 
         if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
-            self.gt_points = np.asarray(self.gt_geometry.points)
+            gt_points = np.asarray(self.gt_geometry.points)
         else:
-            self.gt_points = np.asarray(self.gt_geometry.vertices)
+            gt_points = np.asarray(self.gt_geometry.vertices)
 
-        self.gt_center, self.gt_scale = toNormalizeTransform(self.gt_points)
+        self.gt_center, self.gt_scale = toNormalizeTransform(gt_points)
 
         transGeometry(self.gt_geometry, self.gt_center, self.gt_scale)
+
         if isinstance(self.gt_geometry, o3d.geometry.TriangleMesh):
             self.gt_geometry.compute_vertex_normals()
 
@@ -169,10 +170,6 @@ class OptimalMapper(object):
         self.gt_geometry = gt_pcd
         return self.normalizeGTGeometry()
 
-    def loadGTMesh(self, gt_mesh: o3d.geometry.TriangleMesh) -> bool:
-        self.gt_geometry = gt_mesh
-        return self.normalizeGTGeometry()
-
     def loadGTPcdFile(self, gt_pcd_file_path: str) -> bool:
         if not os.path.exists(gt_pcd_file_path):
             print('[ERROR][OptimalMapper::loadGTPcdFile]')
@@ -190,8 +187,8 @@ class OptimalMapper(object):
             print('\t gt_mesh_file_path:', gt_mesh_file_path)
             return False
 
-        gt_mesh = o3d.io.read_triangle_mesh(gt_mesh_file_path)
-        return self.loadGTMesh(gt_mesh)
+        self.gt_geometry = Mesh(gt_mesh_file_path)
+        return self.normalizeGTGeometry()
 
     def loadTemplateMeshFile(self, template_mesh_file_path: str) -> bool:
         if not os.path.exists(template_mesh_file_path):
@@ -217,7 +214,11 @@ class OptimalMapper(object):
             return False
 
         template_mesh = self.template_mesh.toO3DMesh()
-        transformation = icp(template_mesh, self.gt_geometry)
+        if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
+            gt_geometry = self.gt_geometry
+        else:
+            gt_geometry = self.gt_geometry.toO3DPcd()
+        transformation = icp(template_mesh, gt_geometry)
         assert transformation is not None
 
         template_mesh.transform(transformation)
@@ -256,7 +257,13 @@ class OptimalMapper(object):
             template_triangles
         )
 
-        deform_model = DeformModel(self.template_mesh, self.device)
+        deform_model = DeformModel(
+            self.template_mesh,
+            self.device,
+            fixed_vertex_idxs=self.template_mesh.constrains['fixed_vertex_idxs'],
+            fixed_target_positions=self.gt_geometry.vertices[self.template_mesh.constrains['fixed_vertex_idxs']],
+            vertex_group_idxs=self.template_mesh.constrains['vertex_group_idxs'],
+        )
         deform_model.setDeformGradState(True)
 
         optimizer = torch.optim.AdamW([
