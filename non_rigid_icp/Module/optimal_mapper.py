@@ -266,6 +266,8 @@ class OptimalMapper(object):
         )
         deform_model.setDeformGradState(True)
 
+        deform_model.moveToLandMark()
+
         optimizer = torch.optim.AdamW([
             deform_model.deform_field.rotate_matrixs,
             deform_model.deform_field.translates,
@@ -293,16 +295,25 @@ class OptimalMapper(object):
 
                 masked_dist_loss = toMaskedDistLoss(new_deformed_verts, close_points)
 
-                stiffness_loss = self.stiffness_weights[w_idx] * torch.sum(stiffness)
+                stiffness_weight = self.stiffness_weights[w_idx]
 
-                laplacian_loss = toLaplacianLoss(
-                    new_deformed_verts, template_triangles, source_laplacian)
+                stiffness_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
+                if stiffness_weight > 0:
+                    stiffness_loss = self.stiffness_weights[w_idx] * torch.sum(stiffness)
 
-                laplacian_loss = self.laplacian_weight * laplacian_loss
+                laplacian_loss = torch.tensor(0.0).type(new_deformed_verts.dtype).to(new_deformed_verts.device)
+                if self.laplacian_weight > 0:
+                    laplacian_loss = toLaplacianLoss(
+                        new_deformed_verts, template_triangles, source_laplacian)
 
-                loss = torch.sqrt(masked_dist_loss + stiffness_loss) + laplacian_loss
+                    laplacian_loss = self.laplacian_weight * laplacian_loss
+
+                # loss = torch.sqrt(masked_dist_loss + stiffness_loss) + laplacian_loss
+                loss = masked_dist_loss + stiffness_loss + laplacian_loss
                 loss.backward()
                 optimizer.step()
+
+                deform_model.moveToLandMark()
 
                 self.logger.addScalar('Loss/Stiffness', stiffness_loss.item(), step)
                 self.logger.addScalar('Loss/MatchingDist', masked_dist_loss.item(), step)

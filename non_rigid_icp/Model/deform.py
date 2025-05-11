@@ -28,7 +28,7 @@ class DeformModel(object):
         self.fixed_target_positions = None
         if fixed_vertex_idxs is not None and fixed_target_positions is not None:
             self.fixed_vertex_idxs = toTensor(fixed_vertex_idxs, device, torch.int64)
-            self.fixed_target_positions = toTensor(fixed_target_positions, device, torch.float32)
+            self.fixed_target_positions = toTensor(fixed_target_positions, device, torch.float32).unsqueeze(-1)
         return
 
     def setDeformGradState(self, need_grad: bool, vertex_mask: Union[torch.Tensor, None] = None) -> bool:
@@ -55,7 +55,7 @@ class DeformModel(object):
 
         deformed_fixed_vertices = torch.matmul(fixed_rotate_matrixs, fixed_vertices)
         deformed_fixed_vertices = deformed_fixed_vertices + fixed_translates
-        return deformed_fixed_vertices.squeeze(-1)
+        return deformed_fixed_vertices
 
     #FIXME: need to support the case of multiple land marks on single fixed surface
     def moveToLandMark(self) -> bool:
@@ -70,7 +70,8 @@ class DeformModel(object):
 
         delta_move_vectors = self.fixed_target_positions - deformed_fixed_vertices
 
-        valid_vertex_idxs = self.deform_field.compact_vertex_group_idxs[self.fixed_vertex_idxs]
+        compact_vertex_idxs = self.deform_field.compact_vertex_group_idxs[self.fixed_vertex_idxs]
 
-        self.deform_field.translates[valid_vertex_idxs] = self.deform_field.translates[valid_vertex_idxs] + delta_move_vectors
+        self.deform_field.translates.data[compact_vertex_idxs] += delta_move_vectors
+
         return True

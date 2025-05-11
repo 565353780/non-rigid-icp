@@ -10,8 +10,8 @@ data_dict = {
         './data/target.ply',
     ],
     'airplane_head': [
-        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/airplane_head_template.ply',
-        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/airplane_head_target.ply',
+        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/AMCAX_airplane_head_template.ply',
+        '/home/chli/chLi/Dataset/AMCAX/mesh-fitting/AMCAX_airplane_head_target.ply',
     ],
 }
 
@@ -20,9 +20,9 @@ def demo():
 
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
     inner_iter = 50
-    outer_iter = 100
-    milestones = [50, 80, 100, 110, 120, 130, 140]
-    stiffness_weights = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2]
+    outer_iter = 200
+    milestones = [50, 80, 100, 110, 120, 130, 140, 150]
+    stiffness_weights = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2, 0]
     laplacian_weight = 1.0
     device = 'cuda'
     save_result_folder_path = 'auto'
