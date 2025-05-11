@@ -18,7 +18,7 @@ from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.trans import toNumpy
 from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
-from non_rigid_icp.Method.render import renderGeometryImage, renderPointsImage
+from non_rigid_icp.Method.render import renderGeometryImages
 from non_rigid_icp.Method.trans import toMesh, toNormalizeTransform, toTensor, transGeometry, transPoints
 from non_rigid_icp.Method.video import toVideo
 from non_rigid_icp.Model.deform import DeformModel
@@ -39,6 +39,9 @@ class OptimalMapper(object):
         save_log_folder_path: Union[str, None] = None,
         render: bool=False,
     ) -> None:
+        self.width = 1920 // 3
+        self.height = 1080 // 2
+
         self.inner_iter = inner_iter
         self.outer_iter = outer_iter
         self.milestones = milestones
@@ -60,10 +63,6 @@ class OptimalMapper(object):
             self.chamfer_func = distChamfer
 
         self.initRecords()
-
-        self.phi = 210
-        self.theta = 90
-        self.radius = 1.0
 
         self.gt_points = None
         self.gt_geometry = None
@@ -137,11 +136,10 @@ class OptimalMapper(object):
         self.gt_points = toTensor(self.gt_points, self.device).unsqueeze(0)
 
         if self.render:
-            image = renderGeometryImage(
+            image = renderGeometryImages(
                 self.gt_geometry,
-                phi=self.phi,
-                theta=self.theta,
-                radius=self.radius)
+                width=self.width,
+                height=self.height)
             self.logger.addImage('GT', image)
             if self.save_result_folder_path is not None:
                 cv2.imwrite(self.save_result_folder_path + 'GT.jpg', image)
@@ -156,11 +154,10 @@ class OptimalMapper(object):
         self.template_mesh.normalize()
 
         if self.render:
-            image = renderGeometryImage(
-                self.template_mesh.toO3DMesh(),
-                phi=self.phi,
-                theta=self.theta,
-                radius=self.radius)
+            image = renderGeometryImages(
+                self.template_mesh,
+                width=self.width,
+                height=self.height)
             self.logger.addImage('Template', image)
             if self.save_result_folder_path is not None:
                 cv2.imwrite(self.save_result_folder_path + 'Template.jpg', image)
@@ -226,11 +223,10 @@ class OptimalMapper(object):
         self.updateTemplateVertices(template_mesh.vertices)
 
         if self.render:
-            image = renderGeometryImage(
-                self.template_mesh.toO3DMesh(),
-                phi=self.phi,
-                theta=self.theta,
-                radius=self.radius)
+            image = renderGeometryImages(
+                self.template_mesh,
+                width=self.width,
+                height=self.height)
             self.logger.addImage('ICP', image)
             if self.save_result_folder_path is not None:
                 cv2.imwrite(self.save_result_folder_path + 'ICP.jpg', image)
@@ -327,13 +323,12 @@ class OptimalMapper(object):
 
             if self.render:
                 new_deformed_verts = deform_model.deform()
-                image = renderPointsImage(
-                    new_deformed_verts,
-                    template_triangles,
-                    phi=self.phi,
-                    theta=self.theta,
-                    radius=self.radius
-                )
+                new_deformed_mesh = toMesh(new_deformed_verts, template_triangles)
+                new_deformed_mesh.compute_vertex_normals()
+                image = renderGeometryImages(
+                    new_deformed_mesh,
+                    width=self.width,
+                    height=self.height)
                 self.logger.addImage('DeformedMesh', image, step)
                 if self.save_result_folder_path is not None:
                     cv2.imwrite(save_deformed_image_folder_path + str(self.save_deform_image_idx) + '.jpg', image)
