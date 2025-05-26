@@ -1,27 +1,92 @@
-import torch
 import platform
 import numpy as np
 import open3d as o3d
 from typing import Union
 from copy import deepcopy
 
-from non_rigid_icp.Method.trans import toPointCloud, toMesh
+from non_rigid_icp.Method.trans import toMesh, toPointCloud
 
 
-def renderPoints(points: np.ndarray, window_name="Points", point_show_normal: bool = False):
+def renderPoints(
+    points: np.ndarray, window_name="Points", point_show_normal: bool = False
+):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     return renderGeometries(pcd, window_name, point_show_normal)
 
-def renderGeometries(geometry_list, window_name="Geometry List", point_show_normal: bool = False):
+
+def renderEdges(vertices: np.ndarray, edges: np.ndarray) -> bool:
+    pcd = toPointCloud(vertices)
+
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(vertices)
+
+    if len(edges) > 0:
+        line_set.lines = o3d.utility.Vector2iVector(edges)
+        line_colors = np.array([[1, 0, 0] for _ in range(len(edges))])
+        line_set.colors = o3d.utility.Vector3dVector(line_colors)
+
+    o3d.visualization.draw_geometries(
+        [pcd, line_set], window_name="Grouped Mesh with Diff Group Edges"
+    )
+    return True
+
+
+def renderStiffness(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    stiff_edges: np.ndarray,
+    stiffness: np.ndarray,
+) -> bool:
+    idx1 = stiff_edges[:, 0]
+    idx2 = stiff_edges[:, 1]
+
+    vertex_stiffness = np.zeros([vertices.shape[0]], dtype=np.float32)
+
+    vertex_stiffness[idx1] += stiffness
+    vertex_stiffness[idx2] += stiffness
+
+    mesh = toMesh(vertices, triangles)
+
+    if np.max(vertex_stiffness) > np.min(vertex_stiffness):
+        normalized_stiffness = (vertex_stiffness - np.min(vertex_stiffness)) / (
+            np.max(vertex_stiffness) - np.min(vertex_stiffness)
+        )
+    else:
+        normalized_stiffness = np.zeros_like(vertex_stiffness)
+
+    colors = np.zeros((len(vertices), 3))
+
+    # 红色通道：随着stiffness增加而增加
+    colors[:, 0] = normalized_stiffness
+
+    # 蓝色通道：随着stiffness增加而减少
+    colors[:, 2] = 1.0 - normalized_stiffness
+
+    # 设置点云颜色
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
+    mesh.compute_vertex_normals()
+
+    # 渲染点云
+    o3d.visualization.draw_geometries([mesh], window_name="Stiffness Visualization")
+    return True
+
+
+def renderGeometries(
+    geometry_list, window_name="Geometry List", point_show_normal: bool = False
+):
     if isinstance(geometry_list, np.ndarray):
         return renderPoints(geometry_list, window_name, point_show_normal)
 
     if not isinstance(geometry_list, list):
         geometry_list = [geometry_list]
 
-    o3d.visualization.draw_geometries(geometry_list, window_name, point_show_normal=point_show_normal)
+    o3d.visualization.draw_geometries(
+        geometry_list, window_name, point_show_normal=point_show_normal
+    )
     return True
+
 
 def toPaintedMesh(
     mesh: o3d.geometry.TriangleMesh,
@@ -30,6 +95,7 @@ def toPaintedMesh(
     painted_mesh = deepcopy(mesh)
     painted_mesh.paint_uniform_color(color)
     return painted_mesh
+
 
 def renderColoredMeshes(
     mesh_list: list,
@@ -44,6 +110,7 @@ def renderColoredMeshes(
 
     o3d.visualization.draw_geometries(painted_mesh_list)
     return True
+
 
 def sphericalToCartesian(radius, phi, theta):
     """
@@ -62,7 +129,16 @@ def sphericalToCartesian(radius, phi, theta):
 
     return np.array([x, y, z])
 
-def renderGeometryOnScreen(geometry, phi=45, theta=30, radius=3.0, width=800, height=600, window_name="OnScreenRender"):
+
+def renderGeometryOnScreen(
+    geometry,
+    phi=45,
+    theta=30,
+    radius=3.0,
+    width=800,
+    height=600,
+    window_name="OnScreenRender",
+):
     """
     使用 Open3D 的窗口渲染器渲染点云或三角网格，并返回窗口截图的图像数据 (numpy 数组格式)
 
@@ -94,7 +170,10 @@ def renderGeometryOnScreen(geometry, phi=45, theta=30, radius=3.0, width=800, he
     img_np = (np.asarray(img) * 255).astype(np.uint8)
     return img_np
 
-def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
+
+def renderGeometryOffScreen(
+    geometry, phi=45, theta=30, radius=3.0, width=800, height=600
+):
     """
     使用 Open3D 离屏渲染器渲染点云或三角网格，并返回图像数据 (numpy 数组格式)
 
@@ -135,23 +214,31 @@ def renderGeometryOffScreen(geometry, phi=45, theta=30, radius=3.0, width=800, h
     img_np = np.asarray(img)  # 转换为 numpy 数组
     return img_np
 
+
 def renderGeometryImage(geometry, phi=45, theta=30, radius=3.0, width=800, height=600):
-    if isinstance(geometry, o3d.geometry.PointCloud) or isinstance(geometry, o3d.geometry.TriangleMesh):
+    if isinstance(geometry, o3d.geometry.PointCloud) or isinstance(
+        geometry, o3d.geometry.TriangleMesh
+    ):
         render_geometry = geometry
     else:
         render_geometry = geometry.toO3DMesh()
 
     system = platform.system().lower()
     if system == "linux":
-        return renderGeometryOffScreen(render_geometry, phi, theta, radius, width, height)
+        return renderGeometryOffScreen(
+            render_geometry, phi, theta, radius, width, height
+        )
     else:
-        return renderGeometryOnScreen(render_geometry, phi, theta, radius, width, height)
+        return renderGeometryOnScreen(
+            render_geometry, phi, theta, radius, width, height
+        )
+
 
 def calculateCameraPositionsForSixViews(geometry, fov_degree=60.0):
     """
     基于几何体的轴对齐包围盒（ABB）的8个顶点，计算6个正交视角下的相机位置，
     使相机恰好能够看到ABB的所有8个顶点
-    
+
     :param geometry: Open3D 几何体（点云或三角网格）
     :param fov_degree: 相机视场角（度）
     :return: 包含6个方向相机位置的字典，键为方向名称，值为相机位置（numpy数组）
@@ -169,42 +256,44 @@ def calculateCameraPositionsForSixViews(geometry, fov_degree=60.0):
         except:
             # 如果无法获取ABB，返回空字典
             return {}
-    
+
     # 获取包围盒的8个顶点坐标
     min_bound = np.asarray(abb.min_bound)
     max_bound = np.asarray(abb.max_bound)
-    
+
     # 计算包围盒的中心点
     center = (min_bound + max_bound) / 2
-    
+
     # 计算包围盒的对角线长度
     diagonal = np.linalg.norm(max_bound - min_bound)
-    
+
     # 定义6个正交视角的相机参数（方位角和极角）
     # 前、后、左、右、上、下
     views = {
-        "front": (0, 90),    # 前视图 (phi=0, theta=90)
+        "front": (0, 90),  # 前视图 (phi=0, theta=90)
         "back": (180, 90),  # 后视图 (phi=180, theta=90)
-        "left": (90, 90),   # 左视图 (phi=90, theta=90)
-        "right": (270, 90), # 右视图 (phi=270, theta=90)
-        "top": (0, 0),      # 上视图 (phi=0, theta=0)
-        "bottom": (0, 180)  # 下视图 (phi=0, theta=180)
+        "left": (90, 90),  # 左视图 (phi=90, theta=90)
+        "right": (270, 90),  # 右视图 (phi=270, theta=90)
+        "top": (0, 0),  # 上视图 (phi=0, theta=0)
+        "bottom": (0, 180),  # 下视图 (phi=0, theta=180)
     }
-    
+
     # 计算每个视角的最佳相机距离和位置
     camera_positions = {}
     camera_distances = {}
-    
+
     for view_name, (phi, theta) in views.items():
         # 计算视角方向向量
         phi_rad = np.radians(phi)
         theta_rad = np.radians(theta)
-        view_dir = np.array([
-            np.sin(theta_rad) * np.cos(phi_rad),
-            np.sin(theta_rad) * np.sin(phi_rad),
-            np.cos(theta_rad)
-        ])
-        
+        view_dir = np.array(
+            [
+                np.sin(theta_rad) * np.cos(phi_rad),
+                np.sin(theta_rad) * np.sin(phi_rad),
+                np.cos(theta_rad),
+            ]
+        )
+
         # 计算视角方向上的投影尺寸
         if np.isclose(theta, 0) or np.isclose(theta, 180):  # 上视图或下视图
             # 对于上/下视图，我们关注XY平面的尺寸
@@ -218,91 +307,96 @@ def calculateCameraPositionsForSixViews(geometry, fov_degree=60.0):
         else:
             # 对于其他视角，我们取最大尺寸
             visible_size = diagonal
-        
+
         # 计算所需的相机距离，使物体完全在视野内
         # 使用视场角计算
         fov_rad = np.radians(fov_degree)
         # 添加一个安全系数，确保物体完全在视野内
         safety_factor = 1.5  # 增加安全系数，防止相机钻入物体内部
         distance = (visible_size * 0.5 * safety_factor) / np.tan(fov_rad * 0.5)
-        
+
         # 确保相机距离至少是对角线长度的一半，防止相机太近
         min_safe_distance = diagonal * 0.8
         distance = max(distance, min_safe_distance)
-        
+
         # 计算相机位置（从包围盒中心出发）
         eye = center + view_dir * distance
-        
+
         # 存储相机位置和距离
         camera_positions[view_name] = eye
         camera_distances[view_name] = distance
-    
+
     return camera_positions, camera_distances, center
+
 
 def renderGeometryImages(geometry, width=800, height=600):
     """
     渲染几何体的6个正交视角（前、后、左、右、上、下）并将它们组合成一个2x3的网格图像
     通过在同一个渲染上下文中改变相机位置来提高渲染速度
     根据物体在不同方向的尺寸自适应调整相机距离，确保能够看到物体ABB的所有8个顶点
-    
+
     :param geometry: Open3D 点云、三角网格或自定义几何体（需要有toO3DMesh方法）
     :param width: 单个视角图像的宽度
     :param height: 单个视角图像的高度
     :return: 包含6个视角的组合图像（numpy数组格式）
     """
-    if isinstance(geometry, o3d.geometry.PointCloud) or isinstance(geometry, o3d.geometry.TriangleMesh):
+    if isinstance(geometry, o3d.geometry.PointCloud) or isinstance(
+        geometry, o3d.geometry.TriangleMesh
+    ):
         render_geometry = geometry
     else:
         render_geometry = geometry.toO3DMesh()
 
     # 计算6个视角的相机位置
-    camera_positions, camera_distances, center = calculateCameraPositionsForSixViews(render_geometry)
-    
+    camera_positions, camera_distances, center = calculateCameraPositionsForSixViews(
+        render_geometry
+    )
+
     # 定义6个正交视角的顺序（前、后、左、右、上、下）
     view_names = ["front", "back", "left", "right", "top", "bottom"]
-    
+
     # 创建2x3的网格图像
     grid_height = height * 2
     grid_width = width * 3
     grid_image = np.ones((grid_height, grid_width, 3), dtype=np.uint8) * 255
-    
+
     # 将6个视角图像放置在网格中的位置
     positions = [
-        (0, 0),             # 前视图位置
-        (0, width),          # 后视图位置
-        (0, width * 2),      # 左视图位置
-        (height, 0),         # 右视图位置
-        (height, width),     # 上视图位置
-        (height, width * 2)  # 下视图位置
+        (0, 0),  # 前视图位置
+        (0, width),  # 后视图位置
+        (0, width * 2),  # 左视图位置
+        (height, 0),  # 右视图位置
+        (height, width),  # 上视图位置
+        (height, width * 2),  # 下视图位置
     ]
-    
+
     system = platform.system().lower()
     if system == "linux":
         # 使用离屏渲染器
         render = o3d.visualization.rendering.OffscreenRenderer(width, height)
-        
+
         # 创建材质
         material = o3d.visualization.rendering.MaterialRecord()
         if isinstance(render_geometry, o3d.geometry.PointCloud):
             material.shader = "defaultUnlit"
         elif isinstance(render_geometry, o3d.geometry.TriangleMesh):
             material.shader = "defaultLit"
-        
+
         # 设置背景颜色
         render.scene.set_background([1, 1, 1, 1])  # 白色背景
-        
+
         # 添加几何体（只添加一次）
         render.scene.add_geometry("object", render_geometry, material)
-        
+
         # 渲染每个视角
         images = []
         for i, view_name in enumerate(view_names):
             # 获取相机位置
             eye = camera_positions[view_name]
-            
+
             # 设置摄像机视角 - 确保相机从外部观察物体
             render.scene.camera.look_at(center, eye, np.array([0, 1, 0]))
-            
+
             # 渲染到 numpy 数组
             img = render.render_to_image()
             img_np = np.asarray(img)  # 转换为 numpy 数组
@@ -312,16 +406,16 @@ def renderGeometryImages(geometry, width=800, height=600):
         vis = o3d.visualization.Visualizer()
         vis.create_window(width=width, height=height, visible=False)  # 设置为不可见窗口
         vis.add_geometry(render_geometry)  # 只添加一次几何体
-        
+
         # 获取视图控制器
         ctr = vis.get_view_control()
-        
+
         # 渲染每个视角
         images = []
         for i, view_name in enumerate(view_names):
             # 获取相机位置
             eye = camera_positions[view_name]
-            
+
             # 设置相机参数 - 确保相机从外部观察物体
             ctr.set_lookat(center)  # 设置观察目标为物体中心
             # 计算从相机到中心的方向向量
@@ -329,21 +423,21 @@ def renderGeometryImages(geometry, width=800, height=600):
             ctr.set_front(front_dir)  # 设置相机朝向
             ctr.set_up(np.array([0, 1, 0]))  # 设置上方向
             ctr.set_zoom(0.7)  # 设置缩放比例
-            
+
             # 更新渲染器
             vis.poll_events()
             vis.update_renderer()
-            
+
             # 捕获屏幕
             img = vis.capture_screen_float_buffer(False)
             img_np = (np.asarray(img) * 255).astype(np.uint8)
             images.append(img_np)
-        
+
         # 清理资源
         vis.destroy_window()
-    
+
     # 将渲染的图像放入网格中
     for img, (row, col) in zip(images, positions):
-        grid_image[row:row+height, col:col+width] = img
+        grid_image[row : row + height, col : col + width] = img
 
     return grid_image

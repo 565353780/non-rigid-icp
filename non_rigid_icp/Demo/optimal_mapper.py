@@ -23,7 +23,7 @@ def demo():
 
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
     inner_iter = 50
-    outer_iter = 300
+    outer_iter = 400
     milestones = np.arange(10, outer_iter, 4)
     masked_dist_thresh = float('inf')
     masked_dist_weight = 1.0

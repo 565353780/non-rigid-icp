@@ -1,25 +1,24 @@
 import torch
 import numpy as np
-from torch import nn
 from typing import Union, Tuple
 
 from non_rigid_icp.Data.mesh import Mesh
-from non_rigid_icp.Method.trans import toNumpy, toTensor
+from non_rigid_icp.Method.trans import toTensor
+from non_rigid_icp.Method.render import renderEdges
 
 
 class DeformField(object):
     def __init__(
         self,
         mesh: Mesh,
-        device: str = 'cpu',
+        device: str = "cpu",
         vertex_group_idxs: Union[np.ndarray, list, None] = None,
     ) -> None:
         self.device = device
 
         triangles = mesh.triangles
 
-        edges = np.vstack(
-            [triangles[:, :2], triangles[:, 1:3], triangles[:, [0, 2]]])
+        edges = np.vstack([triangles[:, :2], triangles[:, 1:3], triangles[:, [0, 2]]])
         edges = np.sort(edges, axis=1)
         edges = np.unique(edges, axis=0)
 
@@ -37,6 +36,8 @@ class DeformField(object):
         self.translates = torch.empty(0)
 
         self.updateGroupIdxs(vertex_group_idxs)
+
+        # renderEdges(mesh, self.diff_group_edges.detach().clone().cpu().numpy())
         return
 
     def updateGroupIdxs(
@@ -50,9 +51,15 @@ class DeformField(object):
         self.vertex_group_idxs = toTensor(vertex_group_idxs, self.device, torch.int64)
 
         unique_groups = np.unique(vertex_group_idxs)
-        group_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_groups)}
-        compact_vertex_group_idxs = np.array([group_mapping[idx] for idx in vertex_group_idxs])
-        self.compact_vertex_group_idxs = toTensor(compact_vertex_group_idxs, self.device, torch.int64)
+        group_mapping = {
+            old_idx: new_idx for new_idx, old_idx in enumerate(unique_groups)
+        }
+        compact_vertex_group_idxs = np.array(
+            [group_mapping[idx] for idx in vertex_group_idxs]
+        )
+        self.compact_vertex_group_idxs = toTensor(
+            compact_vertex_group_idxs, self.device, torch.int64
+        )
 
         diff_group_edges_list = []
         for i, edge in enumerate(self.edges):
@@ -64,11 +71,20 @@ class DeformField(object):
         self.diff_group_edges = toTensor(diff_group_edges, self.device, torch.int64)
 
         unique_group_num = unique_groups.shape[0]
-        self.rotate_matrixs = torch.eye(3).reshape(1, 3, 3).repeat(unique_group_num, 1, 1).to(self.device)
-        self.translates = torch.zeros(3).reshape(1, 3, 1).repeat(unique_group_num, 1, 1).to(self.device)
+        self.rotate_matrixs = (
+            torch.eye(3).reshape(1, 3, 3).repeat(unique_group_num, 1, 1).to(self.device)
+        )
+        self.translates = (
+            torch.zeros(3)
+            .reshape(1, 3, 1)
+            .repeat(unique_group_num, 1, 1)
+            .to(self.device)
+        )
         return True
 
-    def setGradState(self, need_grad: bool, vertex_mask: Union[torch.Tensor, None] = None) -> bool:
+    def setGradState(
+        self, need_grad: bool, vertex_mask: Union[torch.Tensor, None] = None
+    ) -> bool:
         if vertex_mask is None:
             self.rotate_matrixs.requires_grad_(need_grad)
             self.translates.requires_grad_(need_grad)
@@ -88,14 +104,12 @@ class DeformField(object):
         r1 = torch.index_select(self.rotate_matrixs, dim=0, index=compact_idx1)
         r2 = torch.index_select(self.rotate_matrixs, dim=0, index=compact_idx2)
         r_diff = (r1 - r2) ** 2
-        rotate_stiffness = torch.sum(r_diff)
 
         t1 = torch.index_select(self.translates, dim=0, index=compact_idx1)
         t2 = torch.index_select(self.translates, dim=0, index=compact_idx2)
         t_diff = (t1 - t2) ** 2
-        translate_stiffness = torch.sum(t_diff)
 
-        return rotate_stiffness, translate_stiffness
+        return r_diff, t_diff
 
     def toRotateMatrixs(self) -> torch.Tensor:
         return self.rotate_matrixs[self.compact_vertex_group_idxs]
