@@ -44,7 +44,7 @@ def demo():
             return False
 
     inner_iter = 50
-    outer_iter = 400
+    outer_iter = 200
     milestones = np.arange(10, outer_iter, 4)
     masked_dist_thresh = float("inf")
     masked_dist_weight = 1.0
@@ -53,7 +53,10 @@ def demo():
     device = "cuda"
     save_result_folder_path = "auto"
     save_log_folder_path = "auto"
-    render = True
+    render = False
+
+    print("milestones:", milestones)
+    print("stiffness_weights:", stiffness_weights)
 
     optimal_mapper = OptimalMapper(
         inner_iter,
