@@ -11,17 +11,17 @@ if torch.cuda.is_available():
 else:
     from non_rigid_icp.Lib.chamfer3D.chamfer_python import distChamfer
 
+from non_rigid_icp.Constraint.fixed_vertex import FixedVertexConstraint
+from non_rigid_icp.Constraint.vertex_group import VertexGroupConstraint
 from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Loss.masked_dist import toMaskedDistLoss
 from non_rigid_icp.Loss.laplacian import toLaplacian, toLaplacianLoss
 from non_rigid_icp.Method.icp import icp
-from non_rigid_icp.Method.trans import toNumpy
-from non_rigid_icp.Method.path import createFileFolder, removeFile
+from non_rigid_icp.Method.trans import toNumpy, toPointCloud
 from non_rigid_icp.Method.time import getCurrentTime
-from non_rigid_icp.Method.render import renderGeometryImages, renderConstrains
+from non_rigid_icp.Method.render import renderGeometryImages, renderConstraints
 from non_rigid_icp.Method.trans import (
     toMesh,
-    toNormalizeTransform,
     toTensor,
     transGeometry,
 )
@@ -73,24 +73,16 @@ class OptimalMapper(object):
 
         self.initRecords()
 
-        self.gt_points = None
-        self.gt_geometry = None
-        self.gt_center = None
-        self.gt_scale = None
-
         self.template_mesh = Mesh()
+        self.target_points = None
+
+        # constraints
+        self.vertex_group_constraint = VertexGroupConstraint()
+        self.fixed_vertex_constraint = FixedVertexConstraint()
 
         # tmp
         self.save_deform_image_idx = 0
         return
-
-    def isGTValid(self) -> bool:
-        if self.gt_geometry is None:
-            print("[ERROR][OptimalMapper::isGTValid]")
-            print("\t gt geometry not exist! please load gt geometry first!")
-            return False
-
-        return True
 
     def isTemplateValid(self) -> bool:
         if not self.template_mesh.isValid():
@@ -102,8 +94,16 @@ class OptimalMapper(object):
 
         return True
 
+    def isTargetValid(self) -> bool:
+        if self.target_points is None:
+            print("[ERROR][OptimalMapper::isTargetValid]")
+            print("\t target points not exist! please load target points first!")
+            return False
+
+        return True
+
     def isValid(self) -> bool:
-        return self.isGTValid() and self.isTemplateValid()
+        return self.isTemplateValid() and self.isTargetValid()
 
     def initRecords(self) -> bool:
         self.save_file_idx = 0
@@ -121,90 +121,36 @@ class OptimalMapper(object):
             self.logger.setLogFolder(self.save_log_folder_path)
         return True
 
-    def normalizeGTGeometry(self) -> bool:
-        if not self.isGTValid():
-            print("[ERROR][OptimalMapper::normalizeGTGeometry]")
-            print("\t isGTValid failed!")
-            return False
-
-        if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
-            gt_points = np.asarray(self.gt_geometry.points)
+    def recordGeometry(
+        self, name: str, vertices: np.ndarray, triangles: Union[np.ndarray, None] = None
+    ):
+        if triangles is None:
+            geometry = toPointCloud(vertices)
+            geometry.estimate_normals()
         else:
-            gt_points = np.asarray(self.gt_geometry.vertices)
-
-        self.gt_center, self.gt_scale = toNormalizeTransform(gt_points)
-
-        transGeometry(self.gt_geometry, self.gt_center, self.gt_scale)
-
-        if isinstance(self.gt_geometry, o3d.geometry.TriangleMesh):
-            self.gt_geometry.compute_vertex_normals()
-
-        if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
-            self.gt_points = np.asarray(self.gt_geometry.points)
-        else:
-            self.gt_points = np.asarray(self.gt_geometry.vertices)
-
-        self.gt_points = toTensor(self.gt_points, self.device).unsqueeze(0)
+            geometry = toMesh(vertices, triangles)
+            geometry.compute_vertex_normals()
 
         if self.render:
-            image = renderGeometryImages(
-                self.gt_geometry, width=self.width, height=self.height
-            )
-            self.logger.addImage("GT", image)
+            image = renderGeometryImages(geometry, width=self.width, height=self.height)
+            self.logger.addImage(name, image)
             if self.save_result_folder_path is not None:
-                cv2.imwrite(self.save_result_folder_path + "GT.jpg", image)
+                cv2.imwrite(self.save_result_folder_path + name + ".jpg", image)
         return True
 
-    def normalizeTemplateMesh(self) -> bool:
-        if not self.isTemplateValid():
-            print("[ERROR][OptimalMapper::normalizeTemplateGeometry]")
-            print("\t isTemplateValid failed!")
-            return False
-
-        self.template_mesh.normalize()
+    def loadTemplateMesh(self, vertices: np.ndarray, triangles: np.ndarray) -> bool:
+        self.template_mesh.vertices = vertices
+        self.template_mesh.triangles = triangles
 
         if self.render:
-            image = renderGeometryImages(
-                self.template_mesh, width=self.width, height=self.height
-            )
-            self.logger.addImage("Template", image)
-            if self.save_result_folder_path is not None:
-                cv2.imwrite(self.save_result_folder_path + "Template.jpg", image)
+            self.recordGeometry("Template", vertices, triangles)
         return True
 
-    def loadGTPcd(self, gt_pcd: o3d.geometry.PointCloud) -> bool:
-        self.gt_geometry = gt_pcd
-        return self.normalizeGTGeometry()
+    def loadTargetPoints(self, vertices: np.ndarray) -> bool:
+        self.target_points = toTensor(vertices, self.device).unsqueeze(0)
 
-    def loadGTPcdFile(self, gt_pcd_file_path: str) -> bool:
-        if not os.path.exists(gt_pcd_file_path):
-            print("[ERROR][OptimalMapper::loadGTPcdFile]")
-            print("\t gt pcd file not exist!")
-            print("\t gt_pcd_file_path:", gt_pcd_file_path)
-            return False
-
-        gt_pcd = o3d.io.read_point_cloud(gt_pcd_file_path)
-        return self.loadGTPcd(gt_pcd)
-
-    def loadGTMeshFile(self, gt_mesh_file_path: str) -> bool:
-        if not os.path.exists(gt_mesh_file_path):
-            print("[ERROR][OptimalMapper::loadGTMeshFile]")
-            print("\t gt mesh file not exist!")
-            print("\t gt_mesh_file_path:", gt_mesh_file_path)
-            return False
-
-        self.gt_geometry = Mesh(gt_mesh_file_path)
-        return self.normalizeGTGeometry()
-
-    def loadTemplateMeshFile(self, template_mesh_file_path: str) -> bool:
-        if not os.path.exists(template_mesh_file_path):
-            print("[ERROR][OptimalMapper::loadTemplateMeshFile]")
-            print("\t template mesh file not exist!")
-            print("\t template_mesh_file_path:", template_mesh_file_path)
-            return False
-
-        self.template_mesh.loadMesh(template_mesh_file_path)
-        self.normalizeTemplateMesh()
+        if self.render:
+            self.recordGeometry("Target", vertices)
         return True
 
     def updateTemplateVertices(
@@ -222,11 +168,9 @@ class OptimalMapper(object):
             return False
 
         template_mesh = self.template_mesh.toO3DMesh()
-        if isinstance(self.gt_geometry, o3d.geometry.PointCloud):
-            gt_geometry = self.gt_geometry
-        else:
-            gt_geometry = self.gt_geometry.toO3DPcd()
-        transformation = icp(template_mesh, gt_geometry)
+        target_pcd = toPointCloud(self.target_points)
+
+        transformation = icp(template_mesh, target_pcd)
         assert transformation is not None
 
         template_mesh.transform(transformation)
@@ -234,13 +178,18 @@ class OptimalMapper(object):
         self.updateTemplateVertices(template_mesh.vertices)
 
         if self.render:
-            image = renderGeometryImages(
-                self.template_mesh, width=self.width, height=self.height
+            self.recordGeometry(
+                "ICP", self.template_mesh.vertices, self.template_mesh.triangles
             )
-            self.logger.addImage("ICP", image)
-            if self.save_result_folder_path is not None:
-                cv2.imwrite(self.save_result_folder_path + "ICP.jpg", image)
         return True
+
+    def addVertexGroupConstraint(self, group_id: int, vertex_idxs: np.ndarray) -> bool:
+        return self.vertex_group_constraint.addConstraint(group_id, vertex_idxs)
+
+    def addFixedVertexConstraint(
+        self, vertex_idxs: np.ndarray, target_positions: np.ndarray
+    ) -> bool:
+        return self.fixed_vertex_constraint.addConstraint(vertex_idxs, target_positions)
 
     def refineGeometry(
         self,
@@ -265,16 +214,17 @@ class OptimalMapper(object):
             template_triangles,
         )
 
-        fixed_vertex_idxs = self.template_mesh.constrains["fixed_vertex_idxs"]
-        fixed_target_positions = self.gt_geometry.vertices[
-            self.template_mesh.constrains["fixed_vertex_idxs"]
-        ]
-        vertex_group_idxs = self.template_mesh.constrains["vertex_group_idxs"]
+        vertex_group_idxs = self.vertex_group_constraint.getConstraint(
+            self.template_mesh.vertices.shape[0]
+        )
+        fixed_vertex_idxs, fixed_target_positions = (
+            self.fixed_vertex_constraint.getConstraint()
+        )
 
         """
-        renderConstrains(
+        renderConstraints(
             self.template_mesh.toO3DPcd(),
-            self.gt_geometry.toO3DPcd(),
+            toPointCloud(self.target_points),
             fixed_vertex_idxs,
             fixed_target_positions,
             vertex_group_idxs,
@@ -305,14 +255,16 @@ class OptimalMapper(object):
         for i in loop:
             new_deformed_verts = deform_model.deform()
 
-            idx1 = self.chamfer_func(new_deformed_verts.unsqueeze(0), self.gt_points)[2]
+            idx1 = self.chamfer_func(
+                new_deformed_verts.unsqueeze(0), self.target_points
+            )[2]
 
             if i == 0:
                 inner_loop = range(4)
             else:
                 inner_loop = range(self.inner_iter)
 
-            close_points = self.gt_points[0, idx1.squeeze(0)]
+            close_points = self.target_points[0, idx1.squeeze(0)]
 
             for _ in inner_loop:
                 optimizer.zero_grad()
@@ -387,7 +339,7 @@ class OptimalMapper(object):
                 step += 1
 
             dist1, dist2 = self.chamfer_func(
-                new_deformed_verts.unsqueeze(0), self.gt_points
+                new_deformed_verts.unsqueeze(0), self.target_points
             )[:2]
             l1_chamfer = toL1ChamferDistance(dist1, dist2)
             self.logger.addScalar("Metric/L1-Chamfer", l1_chamfer, step)
@@ -426,30 +378,4 @@ class OptimalMapper(object):
         return True
 
     def toDeformedTemplateMesh(self) -> o3d.geometry.TriangleMesh:
-        deformed_template_mesh = self.template_mesh.toO3DMesh()
-
-        transGeometry(deformed_template_mesh, self.gt_center, self.gt_scale, True)
-
-        deformed_template_mesh.compute_vertex_normals()
-
-        return deformed_template_mesh
-
-    def saveDeformedTemplateMesh(
-        self, save_mesh_file_path: str, overwrite: bool = False
-    ) -> bool:
-        if os.path.exists(save_mesh_file_path):
-            if not overwrite:
-                return True
-
-            removeFile(save_mesh_file_path)
-
-        createFileFolder(save_mesh_file_path)
-
-        deformed_template_mesh = self.toDeformedTemplateMesh()
-
-        o3d.io.write_triangle_mesh(
-            save_mesh_file_path,
-            deformed_template_mesh,
-            write_ascii=True,
-        )
-        return True
+        return self.template_mesh.clone()

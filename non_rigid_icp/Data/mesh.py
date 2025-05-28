@@ -5,7 +5,7 @@ import open3d as o3d
 from copy import deepcopy
 from typing import Union
 
-from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes, loadConstrains
+from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes
 from non_rigid_icp.Method.path import createFileFolder, removeFile, renameFile
 from non_rigid_icp.Method.render import renderGeometries
 
@@ -22,7 +22,10 @@ class Mesh(object):
         self.vertices = None
 
         self.attributes = None
-        self.constrains = {}
+
+        self.is_normalized = False
+        self.norm_scale = 1.0
+        self.norm_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
         if mesh_file_path is not None:
             self.loadMesh(mesh_file_path)
@@ -37,6 +40,9 @@ class Mesh(object):
 
         self.attributes = None
         return True
+
+    def clone(self):
+        return deepcopy(self)
 
     @classmethod
     def from_o3d(cls, o3d_mesh: o3d.geometry.TriangleMesh):
@@ -69,7 +75,6 @@ class Mesh(object):
 
         if mesh_file_path.endswith(".ply"):
             self.attributes = loadPLYAttributes(mesh_file_path)
-            self.constrains = loadConstrains(self.attributes)
 
         return True
 
@@ -107,11 +112,6 @@ class Mesh(object):
         length = np.max(max_bound - min_bound)
         return length
 
-    def normalize(self) -> bool:
-        scale = 0.9 / self.length()
-        self.vertices = (self.vertices - self.center()) * scale
-        return True
-
     def transform(
         self, center: np.ndarray, scale: float, is_inverse: bool = False
     ) -> bool:
@@ -119,7 +119,18 @@ class Mesh(object):
             self.vertices = self.vertices / scale + center
         else:
             self.vertices = (self.vertices - center) * scale
+        return True
 
+    def normalize(self) -> bool:
+        if self.is_normalized:
+            return True
+
+        self.norm_center = self.center()
+        self.norm_scale = 0.9 / self.length()
+
+        self.transform(self.norm_center, self.norm_scale, is_inverse=False)
+
+        self.is_normalized = True
         return True
 
     def toO3DPcd(self) -> o3d.geometry.PointCloud:

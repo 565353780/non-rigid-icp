@@ -32,7 +32,7 @@ def renderEdges(vertices: np.ndarray, edges: np.ndarray) -> bool:
     return True
 
 
-def renderConstrains(
+def renderConstraints(
     template_pcd: o3d.geometry.PointCloud,
     target_pcd: o3d.geometry.PointCloud,
     fixed_vertex_idxs: np.ndarray,
@@ -41,11 +41,11 @@ def renderConstrains(
 ) -> bool:
     # 检查输入
     if template_pcd is None or target_pcd is None:
-        print("[ERROR][renderConstrains] Invalid point cloud!")
+        print("[ERROR][renderConstraints] Invalid point cloud!")
         return False
 
     if len(fixed_vertex_idxs) == 0:
-        print("[ERROR][renderConstrains] Empty fixed_vertex_idxs!")
+        print("[ERROR][renderConstraints] Empty fixed_vertex_idxs!")
         return False
 
     # 获取点云的点坐标
@@ -95,8 +95,10 @@ def renderConstrains(
     distances = np.linalg.norm(fixed_target_positions - target_fixed_points, axis=1)
     max_distance = np.max(distances)
 
+    print("[INFO][render::renderConstraints]")
     print(
-        f"[INFO][renderConstrains] Maximum distance between fixed target positions and target points: {max_distance:.6f}"
+        "\t Maximum distance between fixed target positions and target points:",
+        max_distance,
     )
 
     # 渲染点云和连接线

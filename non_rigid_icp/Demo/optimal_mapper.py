@@ -1,6 +1,7 @@
 import trimesh
 import numpy as np
 
+from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Module.optimal_mapper import OptimalMapper
 
 
@@ -23,26 +24,7 @@ data_dict = {
 def demo():
     data_id = "airplane_head"
 
-    assert_single_manifold = False
-
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
-    s_mesh = trimesh.load(source_mesh_file_path)
-    is_connected = len(s_mesh.split()) == 1
-    if not is_connected:
-        print("[WARN][optimal_mapper::demo]")
-        print("\t source mesh is not single manifold!")
-        if assert_single_manifold:
-            return False
-
-    source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
-    t_mesh = trimesh.load(source_mesh_file_path)
-    is_connected = len(t_mesh.split()) == 1
-    if not is_connected:
-        print("[WARN][optimal_mapper::demo]")
-        print("\t target mesh is not single manifold!")
-        if assert_single_manifold:
-            return False
-
     inner_iter = 50
     outer_iter = 200
     milestones = np.arange(10, outer_iter, 4)
@@ -72,15 +54,34 @@ def demo():
         render,
     )
 
-    optimal_mapper.loadGTMeshFile(target_mesh_file_path)
-    optimal_mapper.loadTemplateMeshFile(source_mesh_file_path)
+    source_mesh = Mesh(source_mesh_file_path)
+    source_mesh.normalize()
+    optimal_mapper.loadTemplateMesh(source_mesh.vertices, source_mesh.triangles)
+
+    target_mesh = Mesh(target_mesh_file_path)
+    target_mesh.normalize()
+    optimal_mapper.loadTargetPoints(target_mesh.vertices)
 
     optimal_mapper.estimateInitPose()
+
+    group_attr = source_mesh.attributes["vertex_Group"].astype(np.int64)
+
+    grouped_vertex_idxs = np.where(group_attr == 1)[0]
+    fixed_vertex_idxs = np.where(group_attr == 2)[0]
+    fixed_target_positions = target_mesh.vertices[fixed_vertex_idxs]
+
+    optimal_mapper.addVertexGroupConstraint(0, grouped_vertex_idxs)
+    optimal_mapper.addFixedVertexConstraint(fixed_vertex_idxs, fixed_target_positions)
+
     optimal_mapper.refineGeometry()
 
     deformed_mesh = optimal_mapper.toDeformedTemplateMesh()
 
-    optimal_mapper.saveDeformedTemplateMesh(
+    deformed_mesh.transform(
+        target_mesh.norm_center, target_mesh.norm_scale, is_inverse=True
+    )
+
+    deformed_mesh.save(
         optimal_mapper.save_result_folder_path + "optimal_mapper_mesh.ply"
     )
 
