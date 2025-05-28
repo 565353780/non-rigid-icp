@@ -23,7 +23,6 @@ from non_rigid_icp.Method.render import renderGeometryImages, renderConstraints
 from non_rigid_icp.Method.trans import (
     toMesh,
     toTensor,
-    transGeometry,
 )
 from non_rigid_icp.Method.video import toVideo
 from non_rigid_icp.Model.deform import DeformModel
