@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import open3d as o3d
-from typing import Union, Dict, Tuple, List, Any
+from typing import Union, Dict
 
 
 def loadMeshFile(mesh_file_path: str) -> Union[o3d.geometry.TriangleMesh, None]:
@@ -46,24 +46,24 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
     face_count = 0
 
     try:
-        with open(mesh_file_path, 'r') as f:
+        with open(mesh_file_path, "r") as f:
             for line in f:
                 line = line.strip()
-                if line == 'end_header':
+                if line == "end_header":
                     break
 
-                if line.startswith('element vertex'):
-                    current_element = 'vertex'
+                if line.startswith("element vertex"):
+                    current_element = "vertex"
                     vertex_count = int(line.split()[-1])
-                elif line.startswith('element face'):
-                    current_element = 'face'
+                elif line.startswith("element face"):
+                    current_element = "face"
                     face_count = int(line.split()[-1])
-                elif line.startswith('property') and current_element is not None:
+                elif line.startswith("property") and current_element is not None:
                     parts = line.split()
                     # 跳过标准属性 (x,y,z 和 vertex_indices)
-                    if current_element == 'vertex' and parts[-1] not in ['x', 'y', 'z']:
+                    if current_element == "vertex" and parts[-1] not in ["x", "y", "z"]:
                         vertex_properties.append(parts[-1])
-                    elif current_element == 'face' and 'vertex_indices' not in line:
+                    elif current_element == "face" and "vertex_indices" not in line:
                         face_properties.append(parts[-1])
 
         # 如果有额外的顶点属性，读取它们
@@ -73,17 +73,19 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
             vertex_data = [[] for _ in range(len(vertex_properties))]
             vertex_counter = 0
 
-            with open(mesh_file_path, 'r') as f:
+            with open(mesh_file_path, "r") as f:
                 for line in f:
                     line = line.strip()
-                    if line == 'end_header':
+                    if line == "end_header":
                         data_started = True
                         continue
 
                     if data_started and vertex_counter < vertex_count:
                         # 解析顶点行
                         values = line.split()
-                        if len(values) >= 3 + len(vertex_properties):  # x,y,z + 额外属性
+                        if len(values) >= 3 + len(
+                            vertex_properties
+                        ):  # x,y,z + 额外属性
                             for i, prop in enumerate(vertex_properties):
                                 vertex_data[i].append(float(values[3 + i]))
                         vertex_counter += 1
@@ -92,7 +94,7 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
 
             # 将数据转换为numpy数组并存储在属性字典中
             for i, prop in enumerate(vertex_properties):
-                attributes[f'vertex_{prop}'] = np.array(vertex_data[i])
+                attributes[f"vertex_{prop}"] = np.array(vertex_data[i])
 
         # 如果有额外的面属性，读取它们
         if face_properties:
@@ -101,10 +103,10 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
             data_started = False
             vertex_lines_to_skip = vertex_count
 
-            with open(mesh_file_path, 'r') as f:
+            with open(mesh_file_path, "r") as f:
                 for line in f:
                     line = line.strip()
-                    if line == 'end_header':
+                    if line == "end_header":
                         data_started = True
                         continue
 
@@ -119,14 +121,16 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
                             idx_count = int(values[0])
                             if len(values) >= idx_count + 1 + len(face_properties):
                                 for i, prop in enumerate(face_properties):
-                                    face_data[i].append(float(values[idx_count + 1 + i]))
+                                    face_data[i].append(
+                                        float(values[idx_count + 1 + i])
+                                    )
                             face_counter += 1
                         else:
                             break
 
             # 将数据转换为numpy数组并存储在属性字典中
             for i, prop in enumerate(face_properties):
-                attributes[f'face_{prop}'] = np.array(face_data[i])
+                attributes[f"face_{prop}"] = np.array(face_data[i])
 
     except Exception as e:
         print(f"[WARNING][io::loadPLYMeshFile] Error parsing PLY attributes: {e}")
@@ -134,11 +138,12 @@ def loadPLYAttributes(mesh_file_path: str) -> Union[Dict[str, np.ndarray], None]
 
     return attributes
 
+
 def loadConstrains(attributes: dict) -> dict:
     constrains = {}
 
     for key, value in attributes.items():
-        if key == 'vertex_group':
+        if key == "vertex_Group":
             group_idxs = value.astype(np.int64)
 
             fixed_vertex_idxs = np.where(group_idxs == 2)[0]
@@ -146,7 +151,7 @@ def loadConstrains(attributes: dict) -> dict:
             vertex_group_idxs = np.arange(0, group_idxs.shape[0], dtype=np.int64)
             vertex_group_idxs[group_idxs == 1] = group_idxs.shape[0]
 
-            constrains['fixed_vertex_idxs'] = fixed_vertex_idxs
-            constrains['vertex_group_idxs'] = vertex_group_idxs
+            constrains["fixed_vertex_idxs"] = fixed_vertex_idxs
+            constrains["vertex_group_idxs"] = vertex_group_idxs
 
     return constrains

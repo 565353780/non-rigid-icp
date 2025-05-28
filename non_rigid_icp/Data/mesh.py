@@ -1,15 +1,13 @@
 import os
-import torch
 import trimesh
 import numpy as np
 import open3d as o3d
 from copy import deepcopy
-from typing import Union, Tuple
+from typing import Union
 
 from non_rigid_icp.Method.io import loadMeshFile, loadPLYAttributes, loadConstrains
 from non_rigid_icp.Method.path import createFileFolder, removeFile, renameFile
 from non_rigid_icp.Method.render import renderGeometries
-from non_rigid_icp.Module.timer import Timer
 
 
 class Mesh(object):
@@ -65,11 +63,11 @@ class Mesh(object):
             return False
 
         if not self.loadO3DMeshProperties(o3d_mesh):
-            print('[ERROR][Mesh::loadMesh]')
-            print('\t loadO3DMeshProperties failed!')
+            print("[ERROR][Mesh::loadMesh]")
+            print("\t loadO3DMeshProperties failed!")
             return False
 
-        if mesh_file_path.endswith('.ply'):
+        if mesh_file_path.endswith(".ply"):
             self.attributes = loadPLYAttributes(mesh_file_path)
             self.constrains = loadConstrains(self.attributes)
 
@@ -114,7 +112,9 @@ class Mesh(object):
         self.vertices = (self.vertices - self.center()) * scale
         return True
 
-    def transform(self, center: np.ndarray, scale: float, is_inverse: bool = False) -> bool:
+    def transform(
+        self, center: np.ndarray, scale: float, is_inverse: bool = False
+    ) -> bool:
         if is_inverse:
             self.vertices = self.vertices / scale + center
         else:
@@ -183,7 +183,9 @@ class Mesh(object):
 
         o3d_mesh = self.toO3DMesh()
 
-        tmp_save_mesh_file_path = save_mesh_file_path[:-4] + '_tmp' + save_mesh_file_path[-4:]
+        tmp_save_mesh_file_path = (
+            save_mesh_file_path[:-4] + "_tmp" + save_mesh_file_path[-4:]
+        )
 
         createFileFolder(save_mesh_file_path)
 

@@ -18,7 +18,7 @@ from non_rigid_icp.Method.icp import icp
 from non_rigid_icp.Method.trans import toNumpy
 from non_rigid_icp.Method.path import createFileFolder, removeFile
 from non_rigid_icp.Method.time import getCurrentTime
-from non_rigid_icp.Method.render import renderGeometryImages
+from non_rigid_icp.Method.render import renderGeometryImages, renderConstrains
 from non_rigid_icp.Method.trans import (
     toMesh,
     toNormalizeTransform,
@@ -265,14 +265,28 @@ class OptimalMapper(object):
             template_triangles,
         )
 
+        fixed_vertex_idxs = self.template_mesh.constrains["fixed_vertex_idxs"]
+        fixed_target_positions = self.gt_geometry.vertices[
+            self.template_mesh.constrains["fixed_vertex_idxs"]
+        ]
+        vertex_group_idxs = self.template_mesh.constrains["vertex_group_idxs"]
+
+        """
+        renderConstrains(
+            self.template_mesh.toO3DPcd(),
+            self.gt_geometry.toO3DPcd(),
+            fixed_vertex_idxs,
+            fixed_target_positions,
+            vertex_group_idxs,
+        )
+        """
+
         deform_model = DeformModel(
             self.template_mesh,
             self.device,
-            fixed_vertex_idxs=self.template_mesh.constrains["fixed_vertex_idxs"],
-            fixed_target_positions=self.gt_geometry.vertices[
-                self.template_mesh.constrains["fixed_vertex_idxs"]
-            ],
-            vertex_group_idxs=self.template_mesh.constrains["vertex_group_idxs"],
+            fixed_vertex_idxs=fixed_vertex_idxs,
+            fixed_target_positions=fixed_target_positions,
+            vertex_group_idxs=vertex_group_idxs,
         )
         deform_model.setDeformGradState(True)
 

@@ -32,6 +32,81 @@ def renderEdges(vertices: np.ndarray, edges: np.ndarray) -> bool:
     return True
 
 
+def renderConstrains(
+    template_pcd: o3d.geometry.PointCloud,
+    target_pcd: o3d.geometry.PointCloud,
+    fixed_vertex_idxs: np.ndarray,
+    fixed_target_positions: np.ndarray,
+    vertex_group_idxs: np.ndarray,
+) -> bool:
+    # 检查输入
+    if template_pcd is None or target_pcd is None:
+        print("[ERROR][renderConstrains] Invalid point cloud!")
+        return False
+
+    if len(fixed_vertex_idxs) == 0:
+        print("[ERROR][renderConstrains] Empty fixed_vertex_idxs!")
+        return False
+
+    # 获取点云的点坐标
+    template_points = np.asarray(template_pcd.points)
+    target_points = np.asarray(target_pcd.points)
+
+    # 创建点云副本用于渲染
+    template_render = o3d.geometry.PointCloud()
+    template_render.points = o3d.utility.Vector3dVector(template_points)
+    template_colors = np.ones((len(template_points), 3)) * [0.7, 0.7, 0.7]  # 默认灰色
+
+    target_render = o3d.geometry.PointCloud()
+    target_render.points = o3d.utility.Vector3dVector(target_points)
+    target_colors = np.ones((len(target_points), 3)) * [0.7, 0.7, 0.7]  # 默认灰色
+
+    # 将fixed_vertex_idxs对应的点标为红色(模板)和蓝色(目标)
+    template_colors[fixed_vertex_idxs] = [1.0, 0.0, 0.0]  # 红色
+    target_colors[fixed_vertex_idxs] = [0.0, 0.0, 1.0]  # 蓝色
+
+    template_render.colors = o3d.utility.Vector3dVector(template_colors)
+    target_render.colors = o3d.utility.Vector3dVector(target_colors)
+
+    # 创建连接线
+    line_set = o3d.geometry.LineSet()
+
+    # 设置线的端点
+    points = []
+    lines = []
+    line_colors = []
+
+    for i, idx in enumerate(fixed_vertex_idxs):
+        # 添加模板点和目标点
+        points.append(template_points[idx])  # 模板点
+        points.append(target_points[idx])  # 目标点
+
+        # 添加连接线
+        line_idx = i * 2
+        lines.append([line_idx, line_idx + 1])
+        line_colors.append([0.0, 1.0, 0.0])  # 绿色线
+
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(line_colors)
+
+    # 计算fixed_target_positions和target_pcd的fixed_vertex_idxs对应的点的逐点距离的最大值
+    target_fixed_points = target_points[fixed_vertex_idxs]
+    distances = np.linalg.norm(fixed_target_positions - target_fixed_points, axis=1)
+    max_distance = np.max(distances)
+
+    print(
+        f"[INFO][renderConstrains] Maximum distance between fixed target positions and target points: {max_distance:.6f}"
+    )
+
+    # 渲染点云和连接线
+    o3d.visualization.draw_geometries(
+        [template_render, target_render, line_set],
+        window_name="Template and Target Point Clouds with Constraints",
+    )
+    return True
+
+
 def renderStiffness(
     vertices: np.ndarray,
     triangles: np.ndarray,
