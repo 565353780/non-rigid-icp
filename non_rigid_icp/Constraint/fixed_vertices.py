@@ -2,23 +2,26 @@ import numpy as np
 from typing import Tuple
 
 
-class FixedVertexConstraint(object):
+class FixedVerticesConstraint(object):
     def __init__(self):
-        self.fixed_vertex_dict = {}
+        self.fixed_vertices_dict = {}
         return
+
+    def isValid(self) -> bool:
+        return len(self.fixed_vertices_dict) > 0
 
     def addConstraint(
         self, vertex_idxs: np.ndarray, target_positions: np.ndarray
     ) -> bool:
         if vertex_idxs.shape[0] != target_positions.shape[0]:
-            print("[ERROR][FixedVertexConstraint::addConstraint]")
+            print("[ERROR][FixedVerticesConstraint::addConstraint]")
             print("\t vertex_idxs and target_positions size mismatch!")
             print("\t vertex_idxs.shape:", vertex_idxs.shape)
             print("\t target_positions.shape:", target_positions.shape)
             return False
 
         for i in range(vertex_idxs.shape[0]):
-            self.fixed_vertex_dict[vertex_idxs[i]] = target_positions[i]
+            self.fixed_vertices_dict[vertex_idxs[i]] = target_positions[i]
 
         return True
 
@@ -26,7 +29,7 @@ class FixedVertexConstraint(object):
         vertex_idxs = []
         target_positions = []
 
-        for vertex_idx, target_position in self.fixed_vertex_dict.items():
+        for vertex_idx, target_position in self.fixed_vertices_dict.items():
             vertex_idxs.append(vertex_idx)
             target_positions.append(target_position)
 

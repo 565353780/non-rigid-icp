@@ -6,6 +6,9 @@ class VertexGroupConstraint(object):
         self.vertex_group_dict = {}
         return
 
+    def isValid(self) -> bool:
+        return len(self.vertex_group_dict) > 0
+
     def addConstraint(self, group_id: int, vertex_idxs: np.ndarray) -> bool:
         if group_id not in self.vertex_group_dict.keys():
             self.vertex_group_dict[group_id] = vertex_idxs

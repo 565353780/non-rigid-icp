@@ -61,20 +61,19 @@ def demo():
     target_mesh.normalize()
     o3d_mesh = target_mesh.toO3DMesh()
     fps_pcd = o3d_mesh.sample_points_poisson_disk(4 * target_mesh.vertices.shape[0])
-    optimal_mapper.loadTargetPoints(np.asarray(fps_pcd.points))
-
-    optimal_mapper.estimateInitPose()
+    target_points = np.asarray(fps_pcd.points)
+    optimal_mapper.addTargetPointsConstraint(target_points)
 
     group_attr = source_mesh.attributes["vertex_Group"].astype(np.int64)
 
     grouped_vertex_idxs = np.where(group_attr == 1)[0]
+    optimal_mapper.addVertexGroupConstraint(0, grouped_vertex_idxs)
+
     fixed_vertex_idxs = np.where(group_attr == 2)[0]
     fixed_target_positions = target_mesh.vertices[fixed_vertex_idxs]
-
-    optimal_mapper.addVertexGroupConstraint(0, grouped_vertex_idxs)
     optimal_mapper.addFixedVertexConstraint(fixed_vertex_idxs, fixed_target_positions)
 
-    optimal_mapper.refineGeometry()
+    optimal_mapper.map()
 
     deformed_mesh = optimal_mapper.toDeformedTemplateMesh()
 
