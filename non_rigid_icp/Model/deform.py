@@ -106,9 +106,11 @@ class DeformModel(object):
 
         delta_move_vectors = self.fixed_target_positions - deformed_fixed_vertices
 
-        compact_vertex_idxs = self.deform_field.compact_vertex_group_idxs[
-            self.fixed_vertex_idxs
-        ]
+        compact_vertex_idxs = (
+            self.deform_field.stiffness_constraint.compact_vertex_group_idxs[
+                self.fixed_vertex_idxs
+            ]
+        )
 
         self.deform_field.translates.data[compact_vertex_idxs] += delta_move_vectors
 
