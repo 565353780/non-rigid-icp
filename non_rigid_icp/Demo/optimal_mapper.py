@@ -34,7 +34,7 @@ def demo():
     device = "cuda"
     save_result_folder_path = "auto"
     save_log_folder_path = "auto"
-    render = False
+    render = True
 
     print("milestones:", milestones)
     print("stiffness_weights:", stiffness_weights)

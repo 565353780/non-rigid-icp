@@ -230,23 +230,25 @@ class OptimalMapper(object):
             amsgrad=True,
         )
 
+        is_target_points_constraint_valid = self.target_points_constraint.isValid()
+
         step = 0
         for i in loop:
-            new_deformed_verts = deform_model.deform()
-
-            idx1 = self.chamfer_func(
-                new_deformed_verts.unsqueeze(0),
-                self.target_points_constraint.points_tensor,
-            )[2]
-
             if i == 0:
                 inner_loop = range(4)
             else:
                 inner_loop = range(self.inner_iter)
 
-            close_points = self.target_points_constraint.points_tensor[
-                0, idx1.squeeze(0)
-            ]
+            new_deformed_verts = deform_model.deform()
+
+            if is_target_points_constraint_valid:
+                idx1 = self.chamfer_func(
+                    new_deformed_verts.unsqueeze(0),
+                    self.target_points_constraint.points_tensor,
+                )[2]
+                close_points = self.target_points_constraint.points_tensor[
+                    0, idx1.squeeze(0)
+                ]
 
             for _ in inner_loop:
                 optimizer.zero_grad()
@@ -258,10 +260,11 @@ class OptimalMapper(object):
                     .type(new_deformed_verts.dtype)
                     .to(new_deformed_verts.device)
                 )
-                if self.masked_dist_weight > 0:
-                    masked_dist_loss = toMaskedDistLoss(
-                        new_deformed_verts, close_points, self.masked_dist_thresh
-                    )
+                if is_target_points_constraint_valid:
+                    if self.masked_dist_weight > 0:
+                        masked_dist_loss = toMaskedDistLoss(
+                            new_deformed_verts, close_points, self.masked_dist_thresh
+                        )
 
                 rotate_stiffness_loss = (
                     torch.tensor(0.0)
@@ -320,12 +323,13 @@ class OptimalMapper(object):
 
                 step += 1
 
-            dist1, dist2 = self.chamfer_func(
-                new_deformed_verts.unsqueeze(0),
-                self.target_points_constraint.points_tensor,
-            )[:2]
-            l1_chamfer = toL1ChamferDistance(dist1, dist2)
-            self.logger.addScalar("Metric/L1-Chamfer", l1_chamfer, step)
+            if is_target_points_constraint_valid:
+                dist1, dist2 = self.chamfer_func(
+                    new_deformed_verts.unsqueeze(0),
+                    self.target_points_constraint.points_tensor,
+                )[:2]
+                l1_chamfer = toL1ChamferDistance(dist1, dist2)
+                self.logger.addScalar("Metric/L1-Chamfer", l1_chamfer, step)
 
             if self.render:
                 new_deformed_verts = deform_model.deform()
@@ -343,8 +347,6 @@ class OptimalMapper(object):
                         image,
                     )
                     self.save_deform_image_idx += 1
-
-            print(loss.item(), l1_chamfer)
 
             if i in self.milestones:
                 w_idx += 1
