@@ -2,9 +2,12 @@
 __pycache__
 tmp
 
-## output
+# output
 output
 logs
 
-## test_data
+# test_data
 test_data
+
+# script
+sync.sh
