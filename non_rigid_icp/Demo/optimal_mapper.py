@@ -28,6 +28,7 @@ def demo():
     outer_iter = 200
     milestones = np.arange(10, outer_iter, 4)
     masked_dist_thresh = 0.04
+    masked_dist_thresh = float("inf")
     masked_dist_weight = 1.0
     stiffness_weights = 64 * 0.8 ** np.arange(milestones.shape[0] + 1)
     laplacian_weight = 1.0
@@ -60,9 +61,9 @@ def demo():
     target_mesh = Mesh(target_mesh_file_path)
     target_mesh.normalize()
     o3d_mesh = target_mesh.toO3DMesh()
-    fps_pcd = o3d_mesh.sample_points_poisson_disk(4 * target_mesh.vertices.shape[0])
-    target_points = np.asarray(fps_pcd.points)
-    optimal_mapper.addTargetPointsConstraint(target_points)
+    # fps_pcd = o3d_mesh.sample_points_uniformly(4 * target_mesh.vertices.shape[0])
+    # target_points = np.asarray(fps_pcd.points)
+    optimal_mapper.addTargetPointsConstraint(target_mesh.vertices)
 
     group_attr = source_mesh.attributes["vertex_Group"].astype(np.int64)
 
