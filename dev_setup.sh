@@ -1,13 +1,9 @@
-if [ $(uname) = "Darwin" ]; then
-  brew install suite-sparse
-fi
-if [ $(uname) = "Linux" ]; then
-  sudo apt-get install libsuitesparse-dev
-fi
+conda install -c conda-forge suitesparse -y
 
-pip install -U torch torchvision torchaudio
+pip3 install torch torchvision \
+  --index-url https://download.pytorch.org/whl/cu128
 
-pip install -U open3d numpy scipy tqdm scikit-image \
+pip install open3d numpy scipy tqdm scikit-image \
   scikit-learn scikit-sparse tensorboard opencv-python \
   trimesh ninja
 
