@@ -12,6 +12,7 @@ else:
     from non_rigid_icp.Lib.chamfer3D.chamfer_python import distChamfer
 
 from non_rigid_icp.Constraint.target_points import TargetPointsConstraint
+from non_rigid_icp.Constraint.target_vertices import TargetVerticesConstraint
 from non_rigid_icp.Constraint.fixed_vertices import FixedVerticesConstraint
 from non_rigid_icp.Constraint.vertex_group import VertexGroupConstraint
 from non_rigid_icp.Data.mesh import Mesh
@@ -41,6 +42,7 @@ class OptimalMapper(object):
         masked_dist_weight: float = 1.0,
         stiffness_weights: list = [50, 20, 5, 2, 0.8, 0.5, 0.35, 0.2, 0],
         laplacian_weight: float = 1.0,
+        target_vertices_weight: float = 1.0,
         device: str = "cpu",
         save_result_folder_path: Union[str, None] = None,
         save_log_folder_path: Union[str, None] = None,
@@ -57,6 +59,7 @@ class OptimalMapper(object):
         self.masked_dist_weight = masked_dist_weight
         self.stiffness_weights = stiffness_weights
         self.laplacian_weight = laplacian_weight
+        self.target_vertices_weight = target_vertices_weight
 
         self.device = device
 
@@ -77,6 +80,7 @@ class OptimalMapper(object):
 
         # constraints
         self.target_points_constraint = TargetPointsConstraint()
+        self.target_vertices_constraint = TargetVerticesConstraint()
         self.vertex_group_constraint = VertexGroupConstraint()
         self.fixed_vertex_constraint = FixedVerticesConstraint()
 
@@ -112,6 +116,11 @@ class OptimalMapper(object):
 
     def addTargetPointsConstraint(self, target_points: np.ndarray) -> bool:
         return self.target_points_constraint.addConstraint(target_points)
+
+    def addTargetVerticesConstraint(
+        self, vertex_idxs: np.ndarray, target_vertices: np.ndarray
+    ) -> bool:
+        return self.target_vertices_constraint.addConstraint(vertex_idxs, target_vertices)
 
     def addVertexGroupConstraint(self, group_id: int, vertex_idxs: np.ndarray) -> bool:
         return self.vertex_group_constraint.addConstraint(group_id, vertex_idxs)
@@ -178,6 +187,9 @@ class OptimalMapper(object):
                 print("\t estimateInitPose failed!")
                 return False
 
+        if self.target_vertices_constraint.isValid():
+            self.target_vertices_constraint.updateTensor(self.device)
+
         save_deformed_image_folder_path = self.save_result_folder_path + "DeformedMesh/"
         os.makedirs(save_deformed_image_folder_path, exist_ok=True)
 
@@ -231,6 +243,7 @@ class OptimalMapper(object):
         )
 
         is_target_points_constraint_valid = self.target_points_constraint.isValid()
+        is_target_vertices_constraint_valid = self.target_vertices_constraint.isValid()
 
         step = 0
         for i in loop:
@@ -298,12 +311,29 @@ class OptimalMapper(object):
 
                     laplacian_loss = self.laplacian_weight * laplacian_loss
 
+                target_vertices_loss = (
+                    torch.tensor(0.0)
+                    .type(new_deformed_verts.dtype)
+                    .to(new_deformed_verts.device)
+                )
+                if is_target_vertices_constraint_valid:
+                    if self.target_vertices_weight > 0:
+                        target_vertices_loss = (
+                            self.target_vertices_constraint.computeL1Loss(
+                                new_deformed_verts
+                            )
+                        )
+                        target_vertices_loss = (
+                            self.target_vertices_weight * target_vertices_loss
+                        )
+
                 # loss = torch.sqrt(masked_dist_loss + stiffness_loss) + laplacian_loss
                 loss = (
                     masked_dist_loss
                     + rotate_stiffness_loss
                     + translate_stiffness_loss
                     + laplacian_loss
+                    + target_vertices_loss
                 )
                 loss.backward()
                 optimizer.step()
@@ -320,6 +350,9 @@ class OptimalMapper(object):
                     "Loss/MatchingDist", masked_dist_loss.item(), step
                 )
                 self.logger.addScalar("Loss/Laplacian", laplacian_loss.item(), step)
+                self.logger.addScalar(
+                    "Loss/TargetVertices", target_vertices_loss.item(), step
+                )
 
                 step += 1
 
