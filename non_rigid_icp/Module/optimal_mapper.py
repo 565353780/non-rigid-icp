@@ -152,6 +152,11 @@ class OptimalMapper(object):
             print("\t isValid failed!")
             return False
 
+        if not self.target_points_constraint.isValid():
+            print("[ERROR][OptimalMapper::estimateInitPose]")
+            print("\t target_points_constraint is not valid!")
+            return False
+
         template_mesh = self.template_mesh.toO3DMesh()
         target_pcd = toPointCloud(self.target_points_constraint.getConstraint())
 
@@ -205,12 +210,18 @@ class OptimalMapper(object):
             template_triangles,
         )
 
-        vertex_group_idxs = self.vertex_group_constraint.getConstraint(
-            self.template_mesh.vertices.shape[0]
-        )
-        fixed_vertex_idxs, fixed_target_positions = (
-            self.fixed_vertex_constraint.getConstraint()
-        )
+        vertex_group_idxs = None
+        if self.vertex_group_constraint.isValid():
+            vertex_group_idxs = self.vertex_group_constraint.getConstraint(
+                self.template_mesh.vertices.shape[0]
+            )
+
+        fixed_vertex_idxs = None
+        fixed_target_positions = None
+        if self.fixed_vertex_constraint.isValid():
+            fixed_vertex_idxs, fixed_target_positions = (
+                self.fixed_vertex_constraint.getConstraint()
+            )
 
         """
         renderConstraints(
