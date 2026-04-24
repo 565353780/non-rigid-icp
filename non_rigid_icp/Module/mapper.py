@@ -16,6 +16,7 @@ class Mapper(object):
     def mapMesh(
         source_mesh_file_path: str,
         target_mesh_file_path: str,
+        use_non_rigid_icp: bool=True,
         render: bool = False,
     ) -> Union[o3d.geometry.TriangleMesh, None]:
         if not os.path.exists(source_mesh_file_path):
@@ -62,6 +63,9 @@ class Mapper(object):
                     [0.1, 0.9, 0.1],
                 ]
             )
+
+        if not use_non_rigid_icp:
+            return refined_sourcemesh
 
         deformed_mesh = nonrigidIcp(refined_sourcemesh,targetmesh)
 
