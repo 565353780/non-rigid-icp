@@ -28,6 +28,31 @@ def pointsICP(
     else:
         both_normal_exists = False
 
+    # 计算 source / target 的 AABB，按 Open3D 约定（齐次坐标左乘，p' = T @ p）构造
+    # 各向同性缩放 + 平移矩阵，使 sourceply 的 bbox 与 targetply 的 bbox 最接近：
+    #   p' = s * (p - c_s) + c_t = s * p + (c_t - s * c_s)
+    # 其中 s 为两个 bbox 对角线长度之比。
+    source_bbox = sourceply.get_axis_aligned_bounding_box()
+    target_bbox = targetply.get_axis_aligned_bounding_box()
+    source_center = np.asarray(source_bbox.get_center(), dtype=np.float64)
+    target_center = np.asarray(target_bbox.get_center(), dtype=np.float64)
+    source_diag = float(np.linalg.norm(np.asarray(source_bbox.get_extent(), dtype=np.float64)))
+    target_diag = float(np.linalg.norm(np.asarray(target_bbox.get_extent(), dtype=np.float64)))
+    if source_diag > 1e-12 and target_diag > 1e-12:
+        scale = target_diag / source_diag
+    else:
+        scale = 1.0
+
+    bbox_transform = np.eye(4, dtype=np.float64)
+    bbox_transform[:3, :3] *= scale
+    bbox_transform[:3, 3] = target_center - scale * source_center
+
+    # 将该 bbox 对齐变换作用到 source 上，再执行 ICP
+    sourceply.transform(bbox_transform)
+    if both_normal_exists:
+        # 各向同性缩放不改变法向方向，但 transform 会按缩放因子改变其模长，重新归一化
+        sourceply.normalize_normals()
+
     if both_normal_exists:
         estimation_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
     else:
@@ -36,7 +61,11 @@ def pointsICP(
     reg_p2p = o3d.pipelines.registration.registration_icp(
             sourceply, targetply, threshold, trans_init, estimation_method)
 
-    return reg_p2p.transformation
+    # ICP 结果作用在已做 bbox 预对齐后的点上，需将两步变换复合：先 bbox，后 ICP
+    icp_transform = np.asarray(reg_p2p.transformation, dtype=np.float64)
+    final_transform = icp_transform @ bbox_transform
+
+    return final_transform
 
 def icp(
     source: Union[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud],
