@@ -12,8 +12,8 @@ class Mapper(object):
     def __init__(self) -> None:
         return
 
+    @staticmethod
     def mapMesh(
-        self,
         source_mesh_file_path: str,
         target_mesh_file_path: str,
         render: bool = False,
