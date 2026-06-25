@@ -17,6 +17,11 @@ data_dict = {
         "/home/chli/chLi/Dataset/AMCAX/mesh-fitting/AMCAX_airplane_head_template.ply",
         "/home/chli/chLi/Dataset/AMCAX/mesh-fitting/AMCAX_airplane_head_target.ply",
     ],
+    # source = watertight mesh (to be deformed), target = original mesh (fitting goal)
+    "watertight_case1": [
+        "/nvme0pnt/lichanghao/chLi/Dataset/watertight/watertight_case/case1_wt_1536.ply",
+        "/nvme0pnt/lichanghao/chLi/Dataset/watertight/watertight_case/case1_gen.glb",
+    ],
 }
 
 
