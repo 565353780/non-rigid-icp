@@ -43,6 +43,14 @@ class NNIndex(object):
         dist2_np = dist2.cpu().numpy().reshape(-1).astype(np.float32)
         return idx_np, dist2_np
 
+    def queryKNN(self, query_points, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (indices (N, k), squared_distances (N, k)) for arbitrary k."""
+        q = _toO3CTensor(query_points, self.device)
+        idx, dist2 = self._nns.knn_search(q, k)
+        idx_np = idx.cpu().numpy().reshape(-1, k).astype(np.int64)
+        dist2_np = dist2.cpu().numpy().reshape(-1, k).astype(np.float32)
+        return idx_np, dist2_np
+
 
 def nearestIndices(
     query_points,

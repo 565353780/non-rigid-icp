@@ -27,6 +27,15 @@ def demo(
     laplacian_weight: float = 200.0,
     point_to_plane_weight: float = 0.0,
     lr: float = 2e-4,
+    enable_self_collision_guard: bool = True,
+    collision_weight: float = 50.0,
+    collision_margin_tau: float = 0.25,
+    collision_refresh_every: int = 5,
+    max_subdivisions: int = 4,
+    refine_iter: int = 25,
+    plateau_window: int = 6,
+    plateau_rel_tol: float = 3e-3,
+    error_quantile: float = 0.9,
     save_result_folder_path: str = "auto",
 ):
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
@@ -51,6 +60,15 @@ def demo(
         "laplacian_weight": laplacian_weight,
         "point_to_plane_weight": point_to_plane_weight,
         "lr": lr,
+        "enable_self_collision_guard": enable_self_collision_guard,
+        "collision_weight": collision_weight,
+        "collision_margin_tau": collision_margin_tau,
+        "collision_refresh_every": collision_refresh_every,
+        "max_subdivisions": max_subdivisions,
+        "refine_iter": refine_iter,
+        "plateau_window": plateau_window,
+        "plateau_rel_tol": plateau_rel_tol,
+        "error_quantile": error_quantile,
     }
 
     fitter = WatertightFitter(
@@ -63,6 +81,15 @@ def demo(
         eval_samples=eval_samples,
         laplacian_weight=laplacian_weight,
         point_to_plane_weight=point_to_plane_weight,
+        enable_self_collision_guard=enable_self_collision_guard,
+        collision_weight=collision_weight,
+        collision_margin_tau=collision_margin_tau,
+        collision_refresh_every=collision_refresh_every,
+        max_subdivisions=max_subdivisions,
+        refine_iter=refine_iter,
+        plateau_window=plateau_window,
+        plateau_rel_tol=plateau_rel_tol,
+        error_quantile=error_quantile,
         save_result_folder_path=save_result_folder_path,
     )
 
@@ -75,16 +102,24 @@ def demo(
     print("[INFO][demo] baseline (rigid-init only):")
     for k, v in result["baseline"].items():
         print(f"    {k}: {v}")
-    print("[INFO][demo] fitted (deformed):")
+    print("[INFO][demo] fitted (deformed + refined):")
     for k, v in result["fitted"].items():
         print(f"    {k}: {v}")
     print("[INFO][demo] kept:", result["kept"])
+    print("[INFO][demo] refine log:")
+    for r in result["refine_log"]:
+        print("    ", r)
+    print(
+        "[INFO][demo] final new self-intersections:",
+        result["final_new_self_intersections"],
+    )
 
-    metrics = result["metrics"]
     metrics_full = {
         "kept": result["kept"],
         "baseline": result["baseline"],
         "fitted": result["fitted"],
+        "refine_log": result["refine_log"],
+        "final_new_self_intersections": result["final_new_self_intersections"],
     }
     mesh_path = fitter.saveResult(metrics=metrics_full, config=config)
     print("[INFO][demo] saved mesh to", mesh_path)

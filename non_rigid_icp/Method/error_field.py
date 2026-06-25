@@ -1,0 +1,153 @@
+"""Localize high fitting-error regions on the source mesh.
+
+Combines the two error directions of the fit:
+  fit error      source -> target : where the deformed source sits off target.
+  coverage error target -> source : where the original target is under-covered.
+
+Both are reduced to a per-face error, then thresholded (relative to tau and a
+high quantile) and cleaned into connected, dilated face regions that the local
+subdivision will refine. All steps reuse the topology / NN atoms.
+"""
+
+import torch
+import numpy as np
+from typing import Tuple, Union
+
+from non_rigid_icp.Method.nn import NNIndex
+from non_rigid_icp.Method.topology import (
+    dilateFaceMask,
+    connectedFaceComponents,
+)
+
+
+def faceErrorFromVertexError(
+    vertex_error: torch.Tensor, faces: torch.Tensor
+) -> torch.Tensor:
+    """Per-face error as the mean of its three vertex errors. (F,)"""
+    return vertex_error[faces].mean(dim=1)
+
+
+def fitVertexError(
+    deformed_vertices: torch.Tensor, target_index: NNIndex
+) -> torch.Tensor:
+    """Per source-vertex distance to the nearest target surface point. (V,)"""
+    idx, d2 = target_index.query(deformed_vertices, k=1)
+    d = torch.from_numpy(d2).to(deformed_vertices.device).clamp(min=0.0).sqrt()
+    return d
+
+
+def coverageVertexError(
+    deformed_vertices: torch.Tensor,
+    target_points: torch.Tensor,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Coverage error per source vertex.
+
+    For each target point we find the nearest source vertex and record the
+    distance there (worst-case). Source vertices adjacent to large uncovered
+    target areas get a high value. Returns (V,).
+    """
+    v = deformed_vertices.shape[0]
+    src_np = deformed_vertices.detach().cpu().numpy().astype(np.float32)
+    src_index = NNIndex(src_np, device=device)
+    idx, d2 = src_index.query(target_points, k=1)
+    idx_t = torch.from_numpy(idx).to(deformed_vertices.device)
+    d_t = torch.from_numpy(d2).to(deformed_vertices.device).clamp(min=0.0).sqrt()
+
+    cov = torch.zeros(v, device=deformed_vertices.device)
+    cov.scatter_reduce_(0, idx_t, d_t, reduce="amax", include_self=True)
+    return cov
+
+
+def selectHighErrorFaces(
+    face_error: torch.Tensor,
+    tau: float,
+    error_mult: float = 2.0,
+    quantile: float = 0.9,
+    max_faces: Union[int, None] = None,
+) -> Tuple[torch.Tensor, float]:
+    """Boolean mask of faces to refine.
+
+    The primary criterion is ABSOLUTE: refine faces whose error exceeds the
+    tolerance `error_mult * tau` (faces already within tolerance need no
+    refinement). The `quantile` acts as an upper bound (refine at most the worst
+    (1 - quantile) fraction) and `max_faces` as a hard cap, both of which keep
+    the per-round face growth bounded on very large meshes.
+
+    Returns (mask, threshold).
+    """
+    if face_error.numel() < 8_000_000:
+        sample = face_error.float()
+    else:
+        perm = torch.randperm(face_error.numel(), device=face_error.device)[:8_000_000]
+        sample = face_error.float()[perm]
+    q_val = torch.quantile(sample, quantile).item()
+
+    thr = max(error_mult * float(tau), q_val)
+    mask = face_error > thr
+
+    if max_faces is not None and int(mask.sum().item()) > max_faces:
+        topk = torch.topk(face_error, max_faces).indices
+        mask = torch.zeros_like(mask)
+        mask[topk] = True
+    return mask, thr
+
+
+def localizeHighErrorFaces(
+    deformed_vertices: torch.Tensor,
+    faces: torch.Tensor,
+    target_points: torch.Tensor,
+    target_index: NNIndex,
+    face_adjacency: torch.Tensor,
+    tau: float,
+    error_mult: float = 2.0,
+    quantile: float = 0.9,
+    min_component_faces: int = 4,
+    dilation_rings: int = 1,
+    max_faces: Union[int, None] = None,
+    device: str = "cuda",
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Full localization: bidirectional error -> threshold -> clean -> dilate.
+
+    Returns:
+        region_mask: (F,) bool of faces to refine.
+        face_error:  (F,) combined per-face error (for logging / weighting).
+        stats: dict with threshold, counts and error summaries.
+    """
+    fit_v = fitVertexError(deformed_vertices, target_index)
+    cov_v = coverageVertexError(deformed_vertices, target_points, device=device)
+
+    fit_f = faceErrorFromVertexError(fit_v, faces)
+    cov_f = faceErrorFromVertexError(cov_v, faces)
+    face_error = torch.maximum(fit_f, cov_f)
+
+    raw_mask, thr = selectHighErrorFaces(
+        face_error, tau, error_mult, quantile, max_faces=max_faces
+    )
+
+    # drop tiny noise components
+    labels, sizes = connectedFaceComponents(raw_mask, face_adjacency)
+    if sizes.size > 0 and min_component_faces > 1:
+        small = np.nonzero(sizes < min_component_faces)[0]
+        if small.size > 0:
+            small_set = np.isin(labels, small)
+            cleaned_np = raw_mask.detach().cpu().numpy().copy()
+            cleaned_np[small_set] = False
+            cleaned = torch.from_numpy(cleaned_np).to(raw_mask.device)
+        else:
+            cleaned = raw_mask
+    else:
+        cleaned = raw_mask
+
+    region_mask = dilateFaceMask(cleaned, face_adjacency, dilation_rings)
+
+    stats = {
+        "threshold": float(thr),
+        "tau": float(tau),
+        "n_raw": int(raw_mask.sum().item()),
+        "n_region": int(region_mask.sum().item()),
+        "face_error_max": float(face_error.max().item()),
+        "face_error_mean": float(face_error.mean().item()),
+        "n_components": int(sizes.size),
+    }
+    return region_mask, face_error, stats
