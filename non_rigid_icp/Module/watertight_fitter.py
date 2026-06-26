@@ -35,6 +35,7 @@ from non_rigid_icp.Method.trajectory_guard import (
 )
 from non_rigid_icp.Method.spatial_hash import triangleAABBs, estimateCellSize
 from non_rigid_icp.Method.implicit_field import ImplicitField, clampNorm
+from non_rigid_icp.Method.crop import cropMeshByBBox
 from non_rigid_icp.Method.sheet_constraints import (
     detectSheetPairs,
     detectWallPairsRaycast,
@@ -159,6 +160,11 @@ class WatertightFitter(object):
         max_refine_faces: Union[int, None] = 1500000,
         min_component_faces: int = 4,
         dilation_rings: int = 1,
+        # --- region-restricted (bbox) evaluation, in the de-normalized frame ---
+        eval_bbox_center: Union[list, tuple, np.ndarray, None] = None,
+        eval_bbox_edge: Union[float, list, tuple, np.ndarray] = 0.2,
+        eval_bbox_mode: str = "all",
+        crop_eval_samples: int = 300000,
         save_result_folder_path: Union[str, None] = "auto",
         seed: int = 0,
     ) -> None:
@@ -228,6 +234,14 @@ class WatertightFitter(object):
         self.max_refine_faces = max_refine_faces
         self.min_component_faces = min_component_faces
         self.dilation_rings = dilation_rings
+
+        self.eval_bbox_center = (
+            None if eval_bbox_center is None
+            else np.asarray(eval_bbox_center, dtype=np.float64).reshape(3)
+        )
+        self.eval_bbox_edge = eval_bbox_edge
+        self.eval_bbox_mode = eval_bbox_mode
+        self.crop_eval_samples = crop_eval_samples
 
         self.seed = seed
 
@@ -1002,9 +1016,44 @@ class WatertightFitter(object):
     # ------------------------------------------------------------------ #
     # adaptive subdivision                                               #
     # ------------------------------------------------------------------ #
-    def _refine(self, level: int) -> bool:
+    def _applySubdivision(self, region_mask: torch.Tensor) -> Tuple[int, int]:
+        """Atomically refine `region_mask` on BOTH the current (deformed) mesh
+        and the clean rest field, in lock-step.
+
+        First-principles invariant (the user's key simplification): the same
+        edge-midpoint split is applied to the deformed geometry AND to the rest
+        reference `_ref_verts` via `extra_vertex_attrs`, so a new midpoint vertex
+        gets the SAME index in both fields and its rest position is the midpoint
+        of its two rest endpoints. Hence after refinement the per-vertex
+        correspondence ref[i] <-> current[i] still holds for EVERY vertex
+        (original and newly inserted), and the self-intersection trajectory of
+        any vertex is simply the segment `_ref_verts[i] -> deformed[i]` -- no
+        extra bookkeeping (e.g. interpolating new vertices back onto the original
+        watertight surface) is needed.
+
+        The current deformation is baked into the base vertices and `_disp` is
+        restarted at zero (the refinement is geometry preserving, so this is a
+        pure topology change). Returns (vertices_before, faces_before).
+        """
         deformed = self._deformed().detach()
-        region_mask, face_error, stats = localizeHighErrorFaces(
+        new_v, new_f, _, extra = subdivideMarkedFaces(
+            deformed, self._faces, region_mask, extra_vertex_attrs=[self._ref_verts]
+        )
+        v_before, f_before = self._verts.shape[0], self._faces.shape[0]
+        self._verts = new_v.detach().clone()
+        self._faces = new_f
+        self._ref_verts = extra[0].detach().clone()
+        self._disp = torch.zeros_like(self._verts, requires_grad=True)
+        self._optimizer = torch.optim.AdamW([self._disp], lr=self.lr, amsgrad=True)
+        self._buildTopology()
+        self._buildBaseline()
+        return v_before, f_before
+
+    def _localizeHighError(self, level: int) -> Tuple[torch.Tensor, dict]:
+        """Locate the plateaued high-error faces to refine (bidirectional error
+        -> threshold -> clean -> dilate). Returns (region_mask, stats)."""
+        deformed = self._deformed().detach()
+        region_mask, _face_error, stats = localizeHighErrorFaces(
             deformed,
             self._faces,
             self._target_pts,
@@ -1024,26 +1073,17 @@ class WatertightFitter(object):
             f"{n_region} faces marked (thr={stats['threshold']:.6f}, "
             f"max_err={stats['face_error_max']:.6f}).",
         )
-        if n_region == 0:
-            return False
+        return region_mask, stats
 
-        # bake current deformation into the base, carry the clean reference field
-        # through the same split so cumulative motion stays well-defined.
-        new_v, new_f, _, extra = subdivideMarkedFaces(
-            deformed, self._faces, region_mask, extra_vertex_attrs=[self._ref_verts]
-        )
-        v_before, f_before = self._verts.shape[0], self._faces.shape[0]
-        self._verts = new_v.detach().clone()
-        self._faces = new_f
-        self._ref_verts = extra[0].detach().clone()
-        self._disp = torch.zeros_like(self._verts, requires_grad=True)
-        self._optimizer = torch.optim.AdamW([self._disp], lr=self.lr, amsgrad=True)
-        self._buildTopology()
-        self._buildBaseline()
+    def _refine(self, level: int) -> bool:
+        region_mask, stats = self._localizeHighError(level)
+        if int(region_mask.sum().item()) == 0:
+            return False
+        v_before, f_before = self._applySubdivision(region_mask)
         self._refine_log.append(
             {
                 "level": level,
-                "n_region_faces": n_region,
+                "n_region_faces": int(region_mask.sum().item()),
                 "vertices_before": int(v_before),
                 "vertices_after": int(self._verts.shape[0]),
                 "faces_before": int(f_before),
@@ -1125,6 +1165,9 @@ class WatertightFitter(object):
         self._history = []
         self._refine_log = []
         self._traj_step_counter = 0
+        # cached target crop (constant across steps): sampled once on first use
+        self._target_crop_pts = None
+        self._target_crop_nfaces = 0
 
     # ------------------------------------------------------------------ #
     # fit                                                                #
@@ -1391,15 +1434,107 @@ class WatertightFitter(object):
         print("[INFO][stepwise] log saved to", os.path.join(save_folder, "stepwise_log.json"))
         return out
 
-    def _currentChamfer(self) -> dict:
-        """Full Chamfer/F1 of the CURRENT deformed mesh (de-normalized)."""
+    def _currentMeshNormalized(self) -> Mesh:
+        """The CURRENT deformed mesh as a Mesh in the (normalized) fit frame.
+
+        Built once per step and reused by the full Chamfer, the bbox crop eval
+        and the optional full-mesh save, so the (14M-vertex) device->host
+        transfer happens only once."""
+        m = Mesh()
         with torch.no_grad():
-            cur_mesh = Mesh()
-            cur_mesh.vertices = (
-                self._deformed().detach().cpu().numpy().astype(np.float64)
-            )
-            cur_mesh.triangles = self._faces.detach().cpu().numpy()
+            m.vertices = self._deformed().detach().cpu().numpy().astype(np.float64)
+            m.triangles = self._faces.detach().cpu().numpy()
+        return m
+
+    def _currentChamfer(self, cur_mesh: Union[Mesh, None] = None) -> dict:
+        """Full Chamfer/F1 of the CURRENT deformed mesh (de-normalized)."""
+        if cur_mesh is None:
+            cur_mesh = self._currentMeshNormalized()
         return self._evaluateMesh(cur_mesh)
+
+    def _evaluateMeshCropped(
+        self,
+        src_mesh: Mesh,
+        debug_folder: str,
+        tag: str,
+        save_target: bool = True,
+    ) -> dict:
+        """Region-restricted evaluation inside the eval bbox.
+
+        Crops BOTH the (de-normalized) deformed source and the (de-normalized)
+        target to the same axis-aligned box, saves each crop into `debug_folder`
+        and reports Chamfer/F1 computed on the cropped region ONLY -- so the
+        fit quality of a specific region of interest can be tracked and visually
+        inspected during the optimization, independent of the rest of the mesh.
+
+        The target crop is constant across steps, so it is sampled once and
+        cached (and written to `<debug_folder>/target_crop.ply`); the source
+        crop is written as `<debug_folder>/<tag>_crop.ply` every call.
+        """
+        if self.eval_bbox_center is None:
+            return {}
+        os.makedirs(debug_folder, exist_ok=True)
+        center = self.eval_bbox_center
+        edge = self.eval_bbox_edge
+        mode = self.eval_bbox_mode
+        tau = self.L / 2048.0
+
+        # source crop (de-normalize into the original-target frame first)
+        src = src_mesh.clone()
+        src.transform(self.norm_center, self.norm_scale, is_inverse=True)
+        sv, sf, _, _ = cropMeshByBBox(
+            np.asarray(src.vertices), np.asarray(src.triangles), center, edge, mode
+        )
+        src_crop = Mesh()
+        src_crop.vertices = sv.astype(np.float64)
+        src_crop.triangles = sf
+        src_crop.save(os.path.join(debug_folder, f"{tag}_crop.ply"), overwrite=True)
+
+        # target crop: sample + save once, then reuse the cached point set
+        if self._target_crop_pts is None:
+            tgt = self.target_mesh.clone()
+            tgt.transform(self.norm_center, self.norm_scale, is_inverse=True)
+            tv, tf, _, _ = cropMeshByBBox(
+                np.asarray(tgt.vertices), np.asarray(tgt.triangles), center, edge, mode
+            )
+            tgt_crop = Mesh()
+            tgt_crop.vertices = tv.astype(np.float64)
+            tgt_crop.triangles = tf
+            if save_target:
+                tgt_crop.save(
+                    os.path.join(debug_folder, "target_crop.ply"), overwrite=True
+                )
+            self._target_crop_nfaces = int(tf.shape[0])
+            if tf.shape[0] > 0:
+                self._target_crop_pts = sampleMeshSurface(
+                    tgt_crop, self.crop_eval_samples, seed=self.seed + 1
+                )
+            else:
+                self._target_crop_pts = np.zeros((0, 3), dtype=np.float32)
+
+        metrics = {
+            "crop_src_faces": int(sf.shape[0]),
+            "crop_tgt_faces": int(self._target_crop_nfaces),
+        }
+        if sf.shape[0] == 0 or self._target_crop_pts.shape[0] == 0:
+            metrics["crop_chamfer_l1"] = None
+            metrics["crop_f1"] = None
+            return metrics
+        src_pts = sampleMeshSurface(src_crop, self.crop_eval_samples, seed=self.seed)
+        chamfer = computeChamferMetrics(
+            src_pts, self._target_crop_pts, device=self.device
+        )
+        f1 = computeF1AtThreshold(
+            src_pts, self._target_crop_pts, tau, device=self.device
+        )
+        metrics["crop_chamfer_l1"] = chamfer["chamfer_l1"]
+        metrics["crop_chamfer_l2"] = chamfer["chamfer_l2"]
+        metrics["crop_fit_error_l1"] = chamfer["fit_error_l1"]
+        metrics["crop_cov_error_l1"] = chamfer["cov_error_l1"]
+        metrics["crop_f1"] = f1["f1"]
+        metrics["crop_precision"] = f1["precision"]
+        metrics["crop_recall"] = f1["recall"]
+        return metrics
 
     # ------------------------------------------------------------------ #
     # gradient-descent stepwise with per-vertex step clamp (user spec)   #
@@ -1451,18 +1586,26 @@ class WatertightFitter(object):
 
     def fitStepwiseClamped(
         self,
-        n_steps: int = 4,
+        n_steps: int = 20,
         step_frac: float = 0.1,
         gd_lr: float = 0.5,
         lap_w: Union[float, None] = None,
         n_bisect: int = 16,
         resolve_iters: int = 8,
+        pullback_min_move_tau: float = 0.0,
+        max_subdivisions: Union[int, None] = None,
+        plateau_window: Union[int, None] = None,
+        plateau_rel_tol: Union[float, None] = None,
+        plateau_patience: Union[int, None] = None,
+        converge_abs_tau: Union[float, None] = 0.02,
         save_folder: Union[str, None] = None,
         compute_chamfer: bool = True,
-        chamfer_each_step: bool = True,
-        save_meshes: bool = True,
+        crop_eval: bool = True,
+        full_chamfer_each_step: bool = False,
+        save_full_each_step: bool = False,
     ) -> dict:
-        """Gradient-descent stepwise fit with a per-vertex step cap, per the spec.
+        """Gradient-descent stepwise fit with a per-vertex step cap + adaptive
+        subdivision near convergence (per the spec).
 
         Each recorded step:
           1. find each vertex's closest point cp_i on the TARGET surface (exact,
@@ -1474,21 +1617,43 @@ class WatertightFitter(object):
              triangle of the current mesh; pull every offending vertex back along
              its own segment by the minimum distance that removes all crossings
              (largest safe fraction), iterating to a crossing-free fixpoint;
-          4. record the step's residual / repaired count and save the mesh.
+          4. evaluate (region-restricted bbox Chamfer/F1 + optional full Chamfer)
+             and save the (cropped) mesh;
+          5. feed the residual into a plateau monitor: once the error stops
+             dropping meaningfully AND fewer than `max_subdivisions` refinements
+             have been done, adaptively subdivide the high-error region. The SAME
+             split is applied to the rest reference in lock-step, so the
+             per-vertex correspondence (hence the trajectory-crossing test) is
+             preserved across refinement with zero extra bookkeeping.
 
         Plain gradient descent (not Adam) is used on purpose: Adam's per-coord
         adaptive scaling amplifies the tiny near-converged gradient into a
         constant-size thrash; the explicit 0.1 d_i cap is the principled step
-        controller instead. Runs only the first `n_steps` (no subdivision).
+        controller instead.
         """
         self._setupFit()
         dev = self.device
         if save_folder is None:
             save_folder = self.save_result_folder_path or "./output/stepwise_clamped/"
         os.makedirs(save_folder, exist_ok=True)
+        debug_folder = os.path.join(save_folder, "debug")
         tau = self._tau_norm
         if lap_w is None:
             lap_w = self.laplacian_weight
+        if max_subdivisions is None:
+            max_subdivisions = self.max_subdivisions
+        # Subdivide "near convergence". For the clamped 0.1*d_i step the residual
+        # decays geometrically, so the RELATIVE drop is ~constant and never fires
+        # -- the ABSOLUTE per-window improvement (converge_abs_tau, in tau) is the
+        # meaningful "the error curve has flattened" signal. Either criterion
+        # triggers a refinement.
+        monitor = PlateauMonitor(
+            window=plateau_window or self.plateau_window,
+            rel_tol=self.plateau_rel_tol if plateau_rel_tol is None else plateau_rel_tol,
+            patience=plateau_patience or self.plateau_patience,
+            min_updates=plateau_window or self.plateau_window,
+            abs_tol=converge_abs_tau,
+        )
 
         # exact closest-point field over the (normalized) target surface: gives
         # the true face-interior closest point (the move direction + d_i), which
@@ -1498,6 +1663,7 @@ class WatertightFitter(object):
         field = ImplicitField(tV, tF, device=dev)
 
         records = []
+        level = 0  # subdivision rounds done so far
         for step in range(n_steps):
             t0 = time.time()
 
@@ -1506,6 +1672,7 @@ class WatertightFitter(object):
                 cur = self._deformed().detach()
                 cp, _, _ = field.closestPoints(cur)
                 d_i = (cp - cur).norm(dim=1)  # (V,)
+            t_closest = time.time()
 
             # 2 one plain gradient-descent step (data toward cp + Laplacian),
             #   then clamp each vertex's move to step_frac * d_i.
@@ -1529,12 +1696,18 @@ class WatertightFitter(object):
                 clamped_step = clampNorm(raw_step, cap)
                 self._disp.data.add_(clamped_step)
                 step_move = clamped_step.norm(dim=1)
+            t_gd = time.time()
 
             # 3 trajectory check vs ANY face + minimum-distance pull-back,
-            #   iterated to a crossing-free fixpoint over all moved vertices.
+            #   iterated to a crossing-free fixpoint. The candidate set is every
+            #   vertex whose ref->current segment is long enough to plausibly
+            #   pierce a non-incident sheet (default 0: every moved vertex, the
+            #   faithful full check). Correspondence ref[i]<->current[i] holds for
+            #   all vertices (incl. midpoints) thanks to the lock-step subdivision.
             with torch.no_grad():
                 moved = torch.nonzero(
-                    self._cumulativeMotion() > 0, as_tuple=False
+                    self._cumulativeMotion() > (pullback_min_move_tau * tau),
+                    as_tuple=False,
                 ).reshape(-1)
             n_repaired_total = 0
             for _ in range(resolve_iters):
@@ -1542,14 +1715,19 @@ class WatertightFitter(object):
                 n_repaired_total += n_pb
                 if n_pb == 0:
                     break
+            t_pull = time.time()
 
-            # 4 record
+            # 4 record + evaluate
             with torch.no_grad():
                 resid = float(d_i.mean().item())
                 resid_max = float(d_i.max().item())
+            resid_tau = resid / tau
             rec = {
                 "step": step,
-                "fit_residual_mean_tau": resid / tau,
+                "level": level,
+                "n_vertices": int(self._verts.shape[0]),
+                "n_faces": int(self._faces.shape[0]),
+                "fit_residual_mean_tau": resid_tau,
                 "fit_residual_max_tau": resid_max / tau,
                 "data_loss": float(data.item()),
                 "lap_loss": float(lap_loss.item()),
@@ -1557,38 +1735,106 @@ class WatertightFitter(object):
                 "max_step_move_tau": float(step_move.max().item()) / tau,
                 "trajectory_repaired_vertices": int(n_repaired_total),
             }
-            if chamfer_each_step:
-                cm = self._currentChamfer()
+            cur_mesh = None
+            if crop_eval or full_chamfer_each_step or save_full_each_step:
+                cur_mesh = self._currentMeshNormalized()
+            if crop_eval:
+                rec.update(
+                    self._evaluateMeshCropped(
+                        cur_mesh, debug_folder, f"step_{step:02d}",
+                        save_target=(self._target_crop_pts is None),
+                    )
+                )
+            if full_chamfer_each_step:
+                cm = self._currentChamfer(cur_mesh)
                 rec["chamfer_l1"] = cm["chamfer_l1"]
                 rec["f1"] = cm.get("f1")
-            if save_meshes:
+            t_eval = time.time()
+
+            # 5 convergence check -> adaptive subdivision (lock-step on the rest)
+            plateau = monitor.update(resid_tau)
+            rec["rel_drop"] = monitor.last_rel_drop
+            rec["abs_drop_tau"] = monitor.last_abs_drop
+            rec["plateau"] = bool(plateau)
+            do_subdivide = plateau and level < max_subdivisions
+            if save_full_each_step or step == n_steps - 1 or do_subdivide:
                 rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            if do_subdivide:
+                changed = self._refine(level)
+                rec["subdivided"] = bool(changed)
+                if changed:
+                    level += 1
+                    monitor.reset()
+                rec["level_after"] = level
+
+            rec["t_closest_s"] = round(t_closest - t0, 1)
+            rec["t_gd_s"] = round(t_gd - t_closest, 1)
+            rec["t_pullback_s"] = round(t_pull - t_gd, 1)
+            rec["t_eval_s"] = round(t_eval - t_pull, 1)
             rec["seconds"] = round(time.time() - t0, 2)
             records.append(rec)
             print(
-                f"[INFO][stepwise-clamped] step {step}: "
-                f"resid_mean={rec['fit_residual_mean_tau']:.3f}tau, "
-                f"step_move_mean={rec['mean_step_move_tau']:.4f}tau, "
+                f"[INFO][stepwise-clamped] step {step} (lvl {level}, "
+                f"V={rec['n_vertices']}): "
+                f"resid={resid_tau:.3f}tau, "
+                f"move={rec['mean_step_move_tau']:.4f}tau, "
                 f"repaired={rec['trajectory_repaired_vertices']}, "
+                f"rel_drop={monitor.last_rel_drop:.4f}, "
                 + (
-                    f"chamfer_l1={rec.get('chamfer_l1'):.6f}, "
-                    if chamfer_each_step
+                    f"crop_cd={rec.get('crop_chamfer_l1'):.6f}, "
+                    f"crop_f1={rec.get('crop_f1'):.4f}, "
+                    if rec.get("crop_chamfer_l1") is not None
                     else ""
                 )
-                + f"{rec['seconds']}s"
+                + (f"subdiv! " if rec.get("subdivided") else "")
+                + f"[{rec['t_closest_s']}/{rec['t_gd_s']}/"
+                f"{rec['t_pullback_s']}/{rec['t_eval_s']}s] "
+                f"{rec['seconds']}s"
             )
 
-        out = {"n_steps": n_steps, "step_frac": step_frac,
-               "tau": tau / self.norm_scale, "steps": records}
-        if compute_chamfer and not chamfer_each_step:
+        converged = bool(
+            records
+            and (
+                records[-1]["rel_drop"] < monitor.rel_tol
+                or (
+                    converge_abs_tau is not None
+                    and records[-1]["abs_drop_tau"] < converge_abs_tau
+                )
+            )
+        )
+        out = {
+            "method": "stepwise_clamped",
+            "n_steps": n_steps,
+            "step_frac": step_frac,
+            "tau": tau / self.norm_scale,
+            "max_subdivisions": max_subdivisions,
+            "converge_abs_tau": converge_abs_tau,
+            "subdivision_rounds": level,
+            "converged": converged,
+            "eval_bbox_center": (
+                None if self.eval_bbox_center is None
+                else self.eval_bbox_center.tolist()
+            ),
+            "eval_bbox_edge": (
+                self.eval_bbox_edge if np.isscalar(self.eval_bbox_edge)
+                else np.asarray(self.eval_bbox_edge).tolist()
+            ),
+            "steps": records,
+        }
+        if compute_chamfer:
             cm = self._currentChamfer()
             out["final_chamfer_l1"] = cm["chamfer_l1"]
             out["final_f1"] = cm.get("f1")
+            print(
+                "[INFO][stepwise-clamped] final FULL chamfer_l1=",
+                round(cm["chamfer_l1"], 6), "f1=", round(cm.get("f1", 0.0), 6),
+            )
         with open(os.path.join(save_folder, "stepwise_log.json"), "w") as f:
             json.dump(out, f, indent=2)
         print(
-            "[INFO][stepwise-clamped] log saved to",
-            os.path.join(save_folder, "stepwise_log.json"),
+            "[INFO][stepwise-clamped] converged=", converged,
+            "subdivision_rounds=", level,
+            "| log saved to", os.path.join(save_folder, "stepwise_log.json"),
         )
         return out
 

@@ -276,25 +276,49 @@ def demo_stepwise(
 
 def demo_stepwise_clamped(
     data_id: str = "watertight_case1",
-    n_steps: int = 4,
+    n_steps: int = 20,
     step_frac: float = 0.1,
     gd_lr: float = 0.5,
     laplacian_weight: float = 30.0,
     n_bisect: int = 16,
     resolve_iters: int = 8,
+    pullback_min_move_tau: float = 0.0,
     trajectory_seg_chunk: int = 200000,
+    # adaptive subdivision near convergence (the same split is applied to the
+    # rest reference in lock-step, so the trajectory-crossing test stays valid).
+    max_subdivisions: int = 4,
+    plateau_window: int = 2,
+    plateau_rel_tol: float = 5e-3,
+    plateau_patience: int = 1,
+    converge_abs_tau: float = 0.02,
+    # refine faces whose fit/coverage error exceeds error_mult * tau, i.e. those
+    # failing the L/2048 (=1 tau) acceptance bar (capped to the worst
+    # max_refine_faces). 2.0 (the fit() default) is too strict here -- case1's
+    # residuals sit below 2 tau yet still fail the 1-tau F1 bar widely.
+    error_mult: float = 1.0,
+    error_quantile: float = 0.9,
+    max_refine_faces: int = 1500000,
+    # region-restricted (bbox) evaluation, in the de-normalized / original frame
+    eval_bbox_center=(-0.02, 0.23, 0.01),
+    eval_bbox_edge: float = 0.2,
+    eval_bbox_mode: str = "all",
+    crop_eval_samples: int = 300000,
+    crop_eval: bool = True,
+    full_chamfer_each_step: bool = False,
     train_target_samples: int = 2000000,
     eval_samples: int = 500000,
-    chamfer_each_step: bool = True,
-    save_meshes: bool = True,
+    save_full_each_step: bool = False,
     save_result_folder_path: str = "./output/case1_stepwise_clamped/",
 ):
-    """Gradient-descent stepwise fit with a per-vertex step cap (user spec):
-    each step moves every vertex along the data+Laplacian gradient toward its
-    exact closest point on the target, but no more than step_frac * d_i, then
-    checks the ref->current segment against ANY face and pulls every offending
-    vertex back along that segment to the largest crossing-free position. Runs
-    only the first `n_steps`, recording per-step error and mesh.
+    """Gradient-descent stepwise fit with a per-vertex step cap + adaptive
+    subdivision (user spec): each step moves every vertex along the
+    data+Laplacian gradient toward its exact closest point on the target, but no
+    more than step_frac * d_i, then checks the ref->current segment against ANY
+    face and pulls every offending vertex back along that segment to the largest
+    crossing-free position. Near convergence (plateau) the high-error region is
+    locally subdivided -- on both the deformed mesh AND the rest reference in
+    lock-step. Evaluation is restricted to the eval bbox and the crops are saved
+    under <save_folder>/debug/. Runs the first `n_steps`.
     """
     source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
 
@@ -314,9 +338,25 @@ def demo_stepwise_clamped(
         normal_gate=False,
         train_target_samples=train_target_samples,
         eval_samples=eval_samples,
+        # the clamped path enforces no-self-intersection purely via the
+        # trajectory pull-back, so the collision/sheet/inversion guards and the
+        # (expensive, full-mesh) baseline self-intersection scan are not needed.
+        enable_self_collision_guard=False,
+        enable_sheet_guard=False,
+        enable_inversion_guard=False,
         enable_trajectory_guard=True,
         trajectory_seg_chunk=trajectory_seg_chunk,
-        max_subdivisions=0,
+        max_subdivisions=max_subdivisions,
+        plateau_window=plateau_window,
+        plateau_rel_tol=plateau_rel_tol,
+        plateau_patience=plateau_patience,
+        error_mult=error_mult,
+        error_quantile=error_quantile,
+        max_refine_faces=max_refine_faces,
+        eval_bbox_center=eval_bbox_center,
+        eval_bbox_edge=eval_bbox_edge,
+        eval_bbox_mode=eval_bbox_mode,
+        crop_eval_samples=crop_eval_samples,
         save_result_folder_path=save_result_folder_path,
     )
     fitter.loadMeshes(source_mesh, target_mesh)
@@ -329,10 +369,14 @@ def demo_stepwise_clamped(
         lap_w=laplacian_weight,
         n_bisect=n_bisect,
         resolve_iters=resolve_iters,
+        pullback_min_move_tau=pullback_min_move_tau,
+        max_subdivisions=max_subdivisions,
+        converge_abs_tau=converge_abs_tau,
         save_folder=save_result_folder_path,
         compute_chamfer=True,
-        chamfer_each_step=chamfer_each_step,
-        save_meshes=save_meshes,
+        crop_eval=crop_eval,
+        full_chamfer_each_step=full_chamfer_each_step,
+        save_full_each_step=save_full_each_step,
     )
     print("[INFO][demo_stepwise_clamped] done in", round(time.time() - t, 1), "s")
     for rec in out["steps"]:
