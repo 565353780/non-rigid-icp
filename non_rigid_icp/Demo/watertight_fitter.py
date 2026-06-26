@@ -41,6 +41,13 @@ def demo(
     sheet_weight: float = 1000.0,
     enable_inversion_guard: bool = True,
     inversion_weight: float = 20.0,
+    enable_trajectory_guard: bool = True,
+    trajectory_check_inner_every: int = 5,
+    trajectory_active_tau: float = 0.5,
+    trajectory_bisect_steps: int = 12,
+    trajectory_resolve_iters: int = 4,
+    trajectory_final_rounds: int = 24,
+    trajectory_dilation_rings: int = 1,
     strict_no_intersection: bool = True,
     max_subdivisions: int = 4,
     refine_iter: int = 25,
@@ -85,6 +92,13 @@ def demo(
         "sheet_weight": sheet_weight,
         "enable_inversion_guard": enable_inversion_guard,
         "inversion_weight": inversion_weight,
+        "enable_trajectory_guard": enable_trajectory_guard,
+        "trajectory_check_inner_every": trajectory_check_inner_every,
+        "trajectory_active_tau": trajectory_active_tau,
+        "trajectory_bisect_steps": trajectory_bisect_steps,
+        "trajectory_resolve_iters": trajectory_resolve_iters,
+        "trajectory_final_rounds": trajectory_final_rounds,
+        "trajectory_dilation_rings": trajectory_dilation_rings,
         "strict_no_intersection": strict_no_intersection,
         "max_subdivisions": max_subdivisions,
         "refine_iter": refine_iter,
@@ -117,6 +131,13 @@ def demo(
         sheet_weight=sheet_weight,
         enable_inversion_guard=enable_inversion_guard,
         inversion_weight=inversion_weight,
+        enable_trajectory_guard=enable_trajectory_guard,
+        trajectory_check_inner_every=trajectory_check_inner_every,
+        trajectory_active_tau=trajectory_active_tau,
+        trajectory_bisect_steps=trajectory_bisect_steps,
+        trajectory_resolve_iters=trajectory_resolve_iters,
+        trajectory_final_rounds=trajectory_final_rounds,
+        trajectory_dilation_rings=trajectory_dilation_rings,
         strict_no_intersection=strict_no_intersection,
         max_subdivisions=max_subdivisions,
         refine_iter=refine_iter,
@@ -143,7 +164,14 @@ def demo(
     for r in result["refine_log"]:
         print("    ", r)
     print(
-        "[INFO][demo] final new self-intersections:",
+        "[INFO][demo] trajectory crossings:",
+        "vertices=", result.get("trajectory_crossing_vertices"),
+        "pairs=", result.get("trajectory_crossing_pairs"),
+        "faces=", result.get("trajectory_crossing_faces"),
+        "| trajectory_free:", result.get("trajectory_self_intersection_free"),
+    )
+    print(
+        "[INFO][demo] triangle-triangle new self-intersections (supplementary):",
         result["final_new_self_intersections"],
         "| self_intersection_free:",
         result.get("self_intersection_free"),
@@ -156,11 +184,160 @@ def demo(
         "refine_log": result["refine_log"],
         "final_new_self_intersections": result["final_new_self_intersections"],
         "self_intersection_free": result.get("self_intersection_free"),
+        "trajectory_crossing_vertices": result.get("trajectory_crossing_vertices"),
+        "trajectory_crossing_pairs": result.get("trajectory_crossing_pairs"),
+        "trajectory_crossing_faces": result.get("trajectory_crossing_faces"),
+        "trajectory_self_intersection_free": result.get(
+            "trajectory_self_intersection_free"
+        ),
     }
     mesh_path = fitter.saveResult(metrics=metrics_full, config=config)
     print("[INFO][demo] saved mesh to", mesh_path)
 
     return result
+
+
+def demo_stepwise(
+    data_id: str = "watertight_case1",
+    n_steps: int = 4,
+    inner_per_step: int = 1,
+    # bigger step + lighter Laplacian so each recorded step visibly hugs the
+    # target (the v4 fit defaults lr=2e-4/lap=200 barely move a 14M-vert mesh
+    # per step, which is why the error looked flat).
+    lr: float = 1e-3,
+    laplacian_weight: float = 30.0,
+    # freeze vertices already within this many tau of the target so the data
+    # term only moves the genuinely high-error region (case1 is already ~1.2tau
+    # after rigid ICP, so optimizing everything just thrashes fitted layers).
+    error_gate_tau: float = 1.0,
+    normal_gate: bool = True,
+    train_target_samples: int = 2000000,
+    eval_samples: int = 500000,
+    trajectory_resolve_iters: int = 6,
+    trajectory_active_tau: float = 0.5,
+    trajectory_bisect_steps: int = 12,
+    trajectory_check_inner_every: int = 1,
+    compute_chamfer: bool = True,
+    chamfer_each_step: bool = False,
+    save_meshes: bool = True,
+    save_result_folder_path: str = "./output/case1_stepwise/",
+):
+    """Per-step debug run: take the first `n_steps` optimization steps, each one
+    pulling the mesh closer to the target then immediately checking + locally
+    repairing trajectory self-intersections, recording per-step error and mesh.
+    The full Chamfer is computed once at the end by default (per-step Chamfer is
+    expensive); set chamfer_each_step=True to record it every step.
+    """
+    source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
+
+    print("[INFO][demo_stepwise] loading source:", source_mesh_file_path)
+    t = time.time()
+    source_mesh = Mesh(source_mesh_file_path)
+    print("[INFO][demo_stepwise] source loaded in", round(time.time() - t, 1), "s")
+
+    print("[INFO][demo_stepwise] loading target:", target_mesh_file_path)
+    t = time.time()
+    target_mesh = Mesh(target_mesh_file_path)
+    print("[INFO][demo_stepwise] target loaded in", round(time.time() - t, 1), "s")
+
+    fitter = WatertightFitter(
+        device="cuda",
+        lr=lr,
+        laplacian_weight=laplacian_weight,
+        normal_gate=normal_gate,
+        train_target_samples=train_target_samples,
+        eval_samples=eval_samples,
+        enable_trajectory_guard=True,
+        trajectory_resolve_iters=trajectory_resolve_iters,
+        trajectory_active_tau=trajectory_active_tau,
+        trajectory_bisect_steps=trajectory_bisect_steps,
+        trajectory_check_inner_every=trajectory_check_inner_every,
+        # no subdivision in the stepwise diagnostic
+        max_subdivisions=0,
+        save_result_folder_path=save_result_folder_path,
+    )
+    fitter.loadMeshes(source_mesh, target_mesh)
+
+    t = time.time()
+    out = fitter.fitStepwise(
+        n_steps=n_steps,
+        inner_per_step=inner_per_step,
+        error_gate_tau=error_gate_tau,
+        save_folder=save_result_folder_path,
+        compute_chamfer=compute_chamfer,
+        chamfer_each_step=chamfer_each_step,
+        save_meshes=save_meshes,
+    )
+    print("[INFO][demo_stepwise] done in", round(time.time() - t, 1), "s")
+    for rec in out["steps"]:
+        print("    ", rec)
+    return out
+
+
+def demo_stepwise_clamped(
+    data_id: str = "watertight_case1",
+    n_steps: int = 4,
+    step_frac: float = 0.1,
+    gd_lr: float = 0.5,
+    laplacian_weight: float = 30.0,
+    n_bisect: int = 16,
+    resolve_iters: int = 8,
+    trajectory_seg_chunk: int = 200000,
+    train_target_samples: int = 2000000,
+    eval_samples: int = 500000,
+    chamfer_each_step: bool = True,
+    save_meshes: bool = True,
+    save_result_folder_path: str = "./output/case1_stepwise_clamped/",
+):
+    """Gradient-descent stepwise fit with a per-vertex step cap (user spec):
+    each step moves every vertex along the data+Laplacian gradient toward its
+    exact closest point on the target, but no more than step_frac * d_i, then
+    checks the ref->current segment against ANY face and pulls every offending
+    vertex back along that segment to the largest crossing-free position. Runs
+    only the first `n_steps`, recording per-step error and mesh.
+    """
+    source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
+
+    print("[INFO][demo_stepwise_clamped] loading source:", source_mesh_file_path)
+    t = time.time()
+    source_mesh = Mesh(source_mesh_file_path)
+    print("[INFO][demo_stepwise_clamped] source loaded in", round(time.time() - t, 1), "s")
+
+    print("[INFO][demo_stepwise_clamped] loading target:", target_mesh_file_path)
+    t = time.time()
+    target_mesh = Mesh(target_mesh_file_path)
+    print("[INFO][demo_stepwise_clamped] target loaded in", round(time.time() - t, 1), "s")
+
+    fitter = WatertightFitter(
+        device="cuda",
+        laplacian_weight=laplacian_weight,
+        normal_gate=False,
+        train_target_samples=train_target_samples,
+        eval_samples=eval_samples,
+        enable_trajectory_guard=True,
+        trajectory_seg_chunk=trajectory_seg_chunk,
+        max_subdivisions=0,
+        save_result_folder_path=save_result_folder_path,
+    )
+    fitter.loadMeshes(source_mesh, target_mesh)
+
+    t = time.time()
+    out = fitter.fitStepwiseClamped(
+        n_steps=n_steps,
+        step_frac=step_frac,
+        gd_lr=gd_lr,
+        lap_w=laplacian_weight,
+        n_bisect=n_bisect,
+        resolve_iters=resolve_iters,
+        save_folder=save_result_folder_path,
+        compute_chamfer=True,
+        chamfer_each_step=chamfer_each_step,
+        save_meshes=save_meshes,
+    )
+    print("[INFO][demo_stepwise_clamped] done in", round(time.time() - t, 1), "s")
+    for rec in out["steps"]:
+        print("    ", rec)
+    return out
 
 
 if __name__ == "__main__":

@@ -128,5 +128,73 @@ def demo(
     return result
 
 
+def demo_stepwise(
+    data_id: str = "watertight_case1",
+    n_steps: int = 4,
+    step_frac: float = 0.5,
+    stiffness_weight: float = 0.5,
+    stiffness_iters: int = 2,
+    enable_guard: bool = True,
+    guard_iters: int = 8,
+    bisect_steps: int = 14,
+    min_move_tau: float = 0.02,
+    rigid_init: bool = True,
+    train_target_samples: int = 2000000,
+    eval_samples: int = 500000,
+    chamfer_each_step: bool = True,
+    save_meshes: bool = True,
+    final_gate: bool = True,
+    save_result_folder_path: str = "./output/case1_proj_stepwise/",
+):
+    """Per-step closest-point projection fit (the user-specified loop):
+    closest point on target -> step capped to step_frac of the pair distance ->
+    stiffness/ARAP shape preservation -> trajectory self-intersection check with
+    a UNIFIED (batched, simultaneous) pull-back along ref->current. Runs only the
+    first `n_steps`, recording per-step error and mesh.
+    """
+    source_mesh_file_path, target_mesh_file_path = data_dict[data_id]
+
+    print("[INFO][demo_stepwise] loading source:", source_mesh_file_path)
+    t = time.time()
+    source_mesh = Mesh(source_mesh_file_path)
+    print("[INFO][demo_stepwise] source loaded in", round(time.time() - t, 1), "s")
+
+    print("[INFO][demo_stepwise] loading target:", target_mesh_file_path)
+    t = time.time()
+    target_mesh = Mesh(target_mesh_file_path)
+    print("[INFO][demo_stepwise] target loaded in", round(time.time() - t, 1), "s")
+
+    fitter = ProjectionFitter(
+        device="cuda",
+        step_frac=step_frac,
+        stiffness_weight=stiffness_weight,
+        stiffness_iters=stiffness_iters,
+        enable_guard=enable_guard,
+        guard_iters=guard_iters,
+        bisect_steps=bisect_steps,
+        min_move_tau=min_move_tau,
+        rigid_init=rigid_init,
+        max_subdivisions=0,
+        train_target_samples=train_target_samples,
+        eval_samples=eval_samples,
+        save_result_folder_path=save_result_folder_path,
+    )
+    fitter.loadMeshes(source_mesh, target_mesh)
+
+    t = time.time()
+    out = fitter.fitStepwiseProjection(
+        n_steps=n_steps,
+        save_folder=save_result_folder_path,
+        compute_chamfer=True,
+        chamfer_each_step=chamfer_each_step,
+        save_meshes=save_meshes,
+        final_gate=final_gate,
+    )
+    print("[INFO][demo_stepwise] done in", round(time.time() - t, 1), "s")
+    for rec in out["steps"]:
+        print("    ", rec)
+    return out
+
+
 if __name__ == "__main__":
     demo()

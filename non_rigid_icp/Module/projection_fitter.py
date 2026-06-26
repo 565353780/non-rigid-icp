@@ -27,6 +27,7 @@ evaluation harness is shared.
 
 import os
 import json
+import time
 import torch
 import numpy as np
 from tqdm import trange
@@ -56,6 +57,7 @@ from non_rigid_icp.Method.thickness import (
     inwardComponentCap,
 )
 from non_rigid_icp.Method.trajectory_guard import largestSafeStep
+from non_rigid_icp.Method.stiffness_step import stiffnessStep
 from non_rigid_icp.Metric.chamfer import computeChamferMetrics, computeF1AtThreshold
 
 
@@ -82,6 +84,12 @@ class ProjectionFitter(object):
         # --- optional tangential smoothing of the displacement field ---
         smooth_lambda: float = 0.0,
         smooth_iters: int = 0,
+        # --- stiffness (Amberg/ARAP) shape preservation (stepwise mode) ---
+        stiffness_weight: float = 0.5,
+        stiffness_iters: int = 2,
+        # fraction of the closest-point distance a vertex may move in one step;
+        # 0.5 == "move at most half the pair distance" (the user's invariant).
+        step_frac: float = 0.5,
         # --- final acceptance ---
         strict_no_intersection: bool = True,
         final_resolve_rounds: int = 40,
@@ -120,6 +128,10 @@ class ProjectionFitter(object):
 
         self.smooth_lambda = smooth_lambda
         self.smooth_iters = smooth_iters
+
+        self.stiffness_weight = stiffness_weight
+        self.stiffness_iters = stiffness_iters
+        self.step_frac = step_frac
 
         self.strict_no_intersection = strict_no_intersection
         self.final_resolve_rounds = final_resolve_rounds
@@ -473,9 +485,9 @@ class ProjectionFitter(object):
         return n_new
 
     # ------------------------------------------------------------------ #
-    # fit                                                                #
+    # setup (shared by fit + stepwise)                                   #
     # ------------------------------------------------------------------ #
-    def fit(self) -> Mesh:
+    def _setupFit(self) -> None:
         assert self.source_mesh is not None and self.target_mesh is not None
 
         self._rigidInit()
@@ -512,6 +524,194 @@ class ProjectionFitter(object):
         self._refine_log = []
 
         self._buildBaseline()
+
+    # ------------------------------------------------------------------ #
+    # stepwise closest-point projection (user-specified loop)            #
+    # ------------------------------------------------------------------ #
+    def _saveStepMesh(self, folder: str, step: int) -> str:
+        m = Mesh()
+        m.vertices = self._verts.detach().cpu().numpy().astype(np.float64)
+        m.triangles = self._faces.detach().cpu().numpy()
+        m.transform(self.norm_center, self.norm_scale, is_inverse=True)
+        path = os.path.join(folder, f"step_{step:02d}.ply")
+        m.save(path, overwrite=True)
+        return path
+
+    def _currentChamfer(self) -> dict:
+        m = Mesh()
+        m.vertices = self._verts.detach().cpu().numpy().astype(np.float64)
+        m.triangles = self._faces.detach().cpu().numpy()
+        return self._evaluateMesh(m)
+
+    def fitStepwiseProjection(
+        self,
+        n_steps: int = 4,
+        save_folder: Union[str, None] = None,
+        compute_chamfer: bool = True,
+        chamfer_each_step: bool = True,
+        save_meshes: bool = True,
+        final_gate: bool = True,
+    ) -> dict:
+        """One closest-point projection step at a time, exactly as specified:
+
+          1. for every source vertex find its CLOSEST POINT on the target
+             surface (face-interior, via the implicit field) -> this is the move
+             direction and the pair distance d_i = ||cp_i - v_i||;
+          2. move toward cp_i but cap the step to step_frac * d_i (default 1/2),
+             so a vertex can never cross to the wrong layer in one step;
+          3. apply the stiffness / ARAP shape-preservation relaxation (the
+             `Model/deform.py` principle, scaled) so the surface stays smooth;
+          4. check the trajectory self-intersection invariant (segment
+             ref->proposed must not pierce a non-incident face); for every
+             offending vertex compute -- ALL AT ONCE, then write back together --
+             the largest fraction along ref->proposed that is crossing-free and
+             pull it back there;
+          5. record the step's fit residual + repaired count and save the mesh.
+
+        Runs only the first `n_steps`. No subdivision (level-0 diagnostic).
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = self.save_result_folder_path or "./output/proj_stepwise/"
+        os.makedirs(save_folder, exist_ok=True)
+        tau = self._tau_norm
+        guard_inflate = self.guard_inflate_tau * tau
+        min_move = self.min_move_tau * tau
+
+        records = []
+        for step in range(n_steps):
+            t0 = time.time()
+
+            # 1 closest point on target (direction) + 2 capped step (<= 1/2 d_i)
+            cp, _, _ = self._field.closestPoints(self._verts)
+            step_vec = cp - self._verts
+            pair_dist = step_vec.norm(dim=1)
+            cap = (self.step_frac * pair_dist).unsqueeze(1)
+            move_norm = step_vec.norm(dim=1, keepdim=True)
+            scale = torch.clamp(cap / (move_norm + 1e-20), max=1.0)
+            proposed = self._verts + step_vec * scale
+
+            # 3 stiffness / ARAP shape preservation (deform.py principle)
+            proposed = stiffnessStep(
+                proposed,
+                self._ref_verts,
+                self._edges[:, 0],
+                self._edges[:, 1],
+                iters=self.stiffness_iters,
+                weight=self.stiffness_weight,
+            )
+
+            # 4 trajectory self-intersection check + UNIFIED pull-back. Each
+            #   guard pass computes every offending vertex's safe fraction in one
+            #   batched largestSafeStep call, then writes them all back together
+            #   (never vertex-by-vertex); iterate to a crossing-free fixpoint.
+            n_repaired = 0
+            if self.enable_guard:
+                cur = proposed
+                for _g in range(self.guard_iters):
+                    # Select movers by CUMULATIVE motion from the clean rest
+                    # (ref->cur), not the per-step delta: a thin double layer
+                    # closes a little each step, so any single step's delta can
+                    # fall below min_move while the accumulated trajectory still
+                    # pierces the opposite sheet. The ref->cur segment is exactly
+                    # what the trajectory invariant tests, so gating on its length
+                    # is the correct, complete activation set.
+                    move_now = (cur - self._ref_verts).norm(dim=1)
+                    idx = torch.nonzero(
+                        move_now > min_move, as_tuple=False
+                    ).reshape(-1)
+                    if idx.numel() == 0:
+                        break
+                    safe_pos, clamped = largestSafeStep(
+                        self._ref_verts[idx],
+                        cur[idx],
+                        cur,
+                        self._faces,
+                        owner_vid=idx,
+                        inflate=guard_inflate,
+                        n_bisect=self.bisect_steps,
+                    )
+                    nc = int(clamped.sum().item())
+                    n_repaired += nc
+                    if nc == 0:
+                        break
+                    cur = cur.clone()
+                    cur[idx] = safe_pos  # batched, simultaneous write-back
+                proposed = cur
+
+            move = (proposed - self._verts).norm(dim=1)
+            self._verts = proposed
+
+            # 5 record: residual to target (cheap), repaired count, mesh
+            residual = float(pair_dist.mean().item())
+            rec = {
+                "step": step,
+                "fit_residual_mean_tau": residual / tau,
+                "fit_residual_max_tau": float(pair_dist.max().item()) / tau,
+                "mean_move_tau": float(move.mean().item()) / tau,
+                "max_move_tau": float(move.max().item()) / tau,
+                "trajectory_repaired_vertices": int(n_repaired),
+            }
+            if chamfer_each_step:
+                cm = self._currentChamfer()
+                rec["chamfer_l1"] = cm["chamfer_l1"]
+                rec["f1"] = cm.get("f1")
+            if save_meshes:
+                rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            rec["seconds"] = round(time.time() - t0, 2)
+            records.append(rec)
+            print(
+                f"[INFO][proj-stepwise] step {step}: "
+                f"resid_mean={rec['fit_residual_mean_tau']:.3f}tau, "
+                f"move_mean={rec['mean_move_tau']:.3f}tau, "
+                f"repaired={rec['trajectory_repaired_vertices']}, "
+                + (
+                    f"chamfer_l1={rec.get('chamfer_l1'):.6f}, "
+                    if chamfer_each_step
+                    else ""
+                )
+                + f"{rec['seconds']}s"
+            )
+
+        out = {"n_steps": n_steps, "tau": tau / self.norm_scale, "steps": records}
+
+        # authoritative self-intersection accounting + optional hard backstop.
+        # The per-step trajectory guard handles the common case (a vertex tunnels
+        # a sheet); the rarer simultaneous double-layer Jacobi collapse, where
+        # neither segment individually pierces, is caught here by the full-mesh
+        # scan + pin-to-rest gate, guaranteeing the SAVED mesh is crossing-free.
+        n_pre, _ = self._newIntersections()
+        out["new_crossings_before_gate"] = int(n_pre)
+        if final_gate:
+            self._final_new_self_intersections = self._finalGate()
+            out["new_crossings_after_gate"] = int(self._final_new_self_intersections)
+        else:
+            self._final_new_self_intersections = n_pre
+            out["new_crossings_after_gate"] = int(n_pre)
+        print(
+            "[INFO][proj-stepwise] new self-intersections "
+            f"before gate={out['new_crossings_before_gate']}, "
+            f"after gate={out['new_crossings_after_gate']}"
+        )
+
+        if compute_chamfer and not chamfer_each_step:
+            cm = self._currentChamfer()
+            out["final_chamfer_l1"] = cm["chamfer_l1"]
+            out["final_f1"] = cm.get("f1")
+        with open(os.path.join(save_folder, "stepwise_log.json"), "w") as f:
+            json.dump(out, f, indent=2)
+        print(
+            "[INFO][proj-stepwise] log saved to",
+            os.path.join(save_folder, "stepwise_log.json"),
+        )
+        return out
+
+    # ------------------------------------------------------------------ #
+    # fit                                                                #
+    # ------------------------------------------------------------------ #
+    def fit(self) -> Mesh:
+        self._setupFit()
 
         for level in range(self.max_subdivisions + 1):
             self._projectCycle(level)

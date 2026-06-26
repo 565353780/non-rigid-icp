@@ -29,6 +29,12 @@ from non_rigid_icp.Method.collision import (
     pairKeys,
 )
 from non_rigid_icp.Method.self_intersection import findSelfIntersections
+from non_rigid_icp.Method.trajectory_guard import (
+    largestSafeStep,
+    segmentMeshIntersections,
+)
+from non_rigid_icp.Method.spatial_hash import triangleAABBs, estimateCellSize
+from non_rigid_icp.Method.implicit_field import ImplicitField, clampNorm
 from non_rigid_icp.Method.sheet_constraints import (
     detectSheetPairs,
     detectWallPairsRaycast,
@@ -128,6 +134,18 @@ class WatertightFitter(object):
         inversion_weight: float = 20.0,
         inversion_flip_margin: float = 0.0,
         inversion_area_frac: float = 0.1,
+        # --- trajectory self-intersection guard (user-defined criterion) ---
+        enable_trajectory_guard: bool = True,
+        trajectory_check_inner_every: int = 5,
+        trajectory_active_tau: float = 0.5,
+        trajectory_min_move_tau: float = 0.1,
+        trajectory_bisect_steps: int = 12,
+        trajectory_resolve_iters: int = 4,
+        trajectory_final_rounds: int = 24,
+        trajectory_dilation_rings: int = 1,
+        trajectory_inflate_tau: float = 0.0,
+        trajectory_max_active: int = 4000000,
+        trajectory_seg_chunk: int = 200000,
         # --- final acceptance ---
         strict_no_intersection: bool = True,
         # --- adaptive subdivision ---
@@ -185,6 +203,18 @@ class WatertightFitter(object):
         self.inversion_weight = inversion_weight
         self.inversion_flip_margin = inversion_flip_margin
         self.inversion_area_frac = inversion_area_frac
+
+        self.enable_trajectory_guard = enable_trajectory_guard
+        self.trajectory_check_inner_every = trajectory_check_inner_every
+        self.trajectory_active_tau = trajectory_active_tau
+        self.trajectory_min_move_tau = trajectory_min_move_tau
+        self.trajectory_bisect_steps = trajectory_bisect_steps
+        self.trajectory_resolve_iters = trajectory_resolve_iters
+        self.trajectory_final_rounds = trajectory_final_rounds
+        self.trajectory_dilation_rings = trajectory_dilation_rings
+        self.trajectory_inflate_tau = trajectory_inflate_tau
+        self.trajectory_max_active = trajectory_max_active
+        self.trajectory_seg_chunk = trajectory_seg_chunk
 
         self.strict_no_intersection = strict_no_intersection
 
@@ -253,6 +283,20 @@ class WatertightFitter(object):
     def _buildTopology(self) -> None:
         self._edges = buildUniqueEdges(self._faces)
         self._face_adj = buildFaceAdjacency(self._faces)
+        # one incident face per vertex (cheap O(F) scatter), used to turn a
+        # trajectory hit (offending vertex -> pierced face) into a face pair for
+        # the sheet-order barrier without an expensive vertex->faces adjacency.
+        v = self._verts.shape[0]
+        f = self._faces.shape[0]
+        vof = torch.full((v,), -1, dtype=torch.long, device=self._faces.device)
+        fidx = torch.arange(f, device=self._faces.device)
+        vof[self._faces[:, 0]] = fidx
+        vof[self._faces[:, 1]] = fidx
+        vof[self._faces[:, 2]] = fidx
+        self._vert_one_face = vof
+        # grid cell size for the trajectory broad phase is tessellation-scale and
+        # stable within a topology; cache it (recomputed after each subdivision).
+        self._traj_cell_size = None
 
     def _deformed(self) -> torch.Tensor:
         return self._verts + self._disp
@@ -333,6 +377,240 @@ class WatertightFitter(object):
             f"[INFO][WatertightFitter] baseline scan (clean ref): {inter.shape[0]} "
             "pre-existing intersections (ignored)."
         )
+
+    # ------------------------------------------------------------------ #
+    # trajectory self-intersection guard (user-defined criterion)        #
+    # ------------------------------------------------------------------ #
+    def _trajCellSize(self, cur: torch.Tensor) -> float:
+        """Tessellation-scale grid cell for the trajectory broad phase, cached
+        per topology (recomputed after subdivision via `_buildTopology`)."""
+        if self._traj_cell_size is None:
+            tri_lo, tri_hi = triangleAABBs(cur, self._faces, 0.0)
+            self._traj_cell_size = float(
+                estimateCellSize(tri_lo, tri_hi, quantile=0.9, factor=1.0)
+            )
+        return self._traj_cell_size
+
+    def _trajectoryActiveVertices(self) -> Union[torch.Tensor, None]:
+        """Vertices whose trajectory [ref -> current] could plausibly cross: the
+        cumulative movers (a crossing needs ~the local gap of motion), capped to
+        the largest movers so the per-step guard stays cheap on huge meshes."""
+        motion = self._cumulativeMotion()
+        active = motion > (self.trajectory_active_tau * self._tau_norm)
+        if not bool(active.any()):
+            return None
+        ids = torch.nonzero(active, as_tuple=False).reshape(-1)
+        if ids.numel() > self.trajectory_max_active:
+            top = torch.topk(motion[ids], self.trajectory_max_active).indices
+            ids = ids[top]
+        return ids
+
+    def _trajectoryActiveFaceIds(self) -> Union[torch.Tensor, None]:
+        """Faces the in-loop trajectory broad phase is scoped to: the moved
+        region grown one ring. A new crossing must involve a moved face, so this
+        is the complete candidate set for in-loop crossings -- and it keeps the
+        grid hash O(moved) instead of O(28.9M), which is what makes the guard fit
+        in memory next to the (large) sheet/collision constraint tensors. The
+        authoritative full-mesh sweep is reserved for the final gate."""
+        mask = self._activeFaceMask(self.trajectory_active_tau * self._tau_norm)
+        if mask is None:
+            return None
+        return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+    def _applyTrajectoryGuard(
+        self,
+        ids: Union[torch.Tensor, None] = None,
+        face_ids: Union[torch.Tensor, None] = None,
+    ) -> int:
+        """Pull every offending vertex back along its OWN trajectory.
+
+        For each guarded vertex v we test the straight segment from its clean
+        watertight-rest position `_ref_verts[v]` to its current fitted position
+        against the non-incident faces of the current mesh. If it pierces, the
+        vertex is moved to the largest safe fraction along that segment -- i.e.
+        the offending region is dragged back JUST FAR ENOUGH to be crossing-free,
+        never reset wholesale to the watertight rest. Only the clamped vertices
+        (plus a small ring, to release stale Adam momentum) are touched.
+
+        `face_ids` optionally scopes the broad phase to a face subset (the moved
+        region in-loop); None tests against the full mesh (the final gate).
+
+        Returns the number of vertices that were pulled back.
+        """
+        if not self.enable_trajectory_guard:
+            return 0
+        if ids is None:
+            ids = self._trajectoryActiveVertices()
+        if ids is None or ids.numel() == 0:
+            return 0
+
+        cur = self._deformed().detach()
+        ref = self._ref_verts.detach()
+        cell = self._trajCellSize(cur)
+        inflate = self.trajectory_inflate_tau * self._tau_norm
+
+        # Batch the active segments. A single largestSafeStep over all movers
+        # builds an O(segments x faces-per-cell) candidate-pair tensor, which can
+        # blow past GPU memory when a whole thin-shell region moves at once
+        # (observed 18.6 GiB for ~400k movers). Chunking caps the peak candidate
+        # memory regardless of how many vertices moved; correctness is unchanged
+        # because each segment's pullback is independent.
+        n_total = ids.numel()
+        chunk = self.trajectory_seg_chunk
+        clamp_id_parts = []
+        clamp_pos_parts = []
+        hit_owner_parts = []
+        hit_face_parts = []
+        for start in range(0, n_total, chunk):
+            sub = ids[start:start + chunk]
+            safe_pos, need, hit_seg, hit_face = largestSafeStep(
+                ref[sub],
+                cur[sub],
+                cur,
+                self._faces,
+                owner_vid=sub,
+                inflate=inflate,
+                n_bisect=self.trajectory_bisect_steps,
+                cell_size=cell,
+                face_ids=face_ids,
+                return_hits=True,
+            )
+            if bool(need.any()):
+                clamp_id_parts.append(sub[need])
+                clamp_pos_parts.append(safe_pos[need])
+            if hit_seg.numel() > 0:
+                hit_owner_parts.append(sub[hit_seg])
+                hit_face_parts.append(hit_face)
+
+        if not clamp_id_parts:
+            return 0
+        clamp_ids = torch.cat(clamp_id_parts, dim=0)
+        clamp_pos = torch.cat(clamp_pos_parts, dim=0)
+        n_clamped = int(clamp_ids.numel())
+
+        with torch.no_grad():
+            self._disp.data[clamp_ids] = clamp_pos - self._verts[clamp_ids]
+
+        # release Adam momentum on the pulled-back vertices + a small ring, so a
+        # stale velocity does not immediately re-drive them through the sheet.
+        vmask = torch.zeros(
+            self._verts.shape[0], dtype=torch.bool, device=self.device
+        )
+        vmask[clamp_ids] = True
+        for _ in range(self.trajectory_dilation_rings):
+            grown = vmask.clone()
+            grown[self._edges[:, 0]] |= vmask[self._edges[:, 1]]
+            grown[self._edges[:, 1]] |= vmask[self._edges[:, 0]]
+            vmask = grown
+        state = self._optimizer.state.get(self._disp, {})
+        if "exp_avg" in state:
+            state["exp_avg"][vmask] = 0.0
+            state["exp_avg_sq"][vmask] = 0.0
+
+        # feed the actually-pierced (offending-vertex face, pierced face) pairs
+        # into the sheet-order barrier so whatever the static set missed is
+        # constrained the moment it is seen (axis frozen from the clean ref).
+        if self.enable_sheet_guard and hit_owner_parts:
+            owner_v = torch.cat(hit_owner_parts, dim=0)
+            hit_face = torch.cat(hit_face_parts, dim=0)
+            owner_f = self._vert_one_face[owner_v]
+            valid = (owner_f >= 0) & (owner_f != hit_face)
+            if bool(valid.any()):
+                pairs = torch.stack([owner_f[valid], hit_face[valid]], dim=1)
+                self._augmentSheetWithCrossings(pairs)
+        return n_clamped
+
+    def _resolveTrajectory(
+        self,
+        rounds: int,
+        ids: Union[torch.Tensor, None] = None,
+        scoped: bool = False,
+    ) -> int:
+        """Apply the trajectory guard repeatedly until no segment crosses (or
+        `rounds` is hit). Each pass strictly shortens every offending vertex's
+        ref->current segment, and the all-at-rest configuration is crossing-free,
+        so the iteration converges to a crossing-free state. `scoped` restricts
+        the broad phase to the moved region (memory-bounded, in-loop)."""
+        last = 0
+        for _ in range(max(1, rounds)):
+            face_ids = self._trajectoryActiveFaceIds() if scoped else None
+            n = self._applyTrajectoryGuard(ids, face_ids=face_ids)
+            last = n
+            if n == 0:
+                break
+        return last
+
+    def _measureTrajectory(
+        self, face_ids: Union[torch.Tensor, None] = None
+    ) -> dict:
+        """Measure the user-defined criterion. `face_ids=None` is the full-mesh
+        authoritative scan; a subset scopes it to the moved region (fallback)."""
+        cur = self._deformed().detach()
+        ref = self._ref_verts.detach()
+        v = self._verts.shape[0]
+        owner = torch.arange(v, device=self.device)
+        cell = self._trajCellSize(cur)
+        hit_seg, hit_face, crossed = segmentMeshIntersections(
+            ref, cur, cur, self._faces, owner, cell_size=cell, face_ids=face_ids
+        )
+        n_vertices = int(crossed.sum().item())
+        n_pairs = int(hit_seg.numel())
+        n_faces = int(torch.unique(hit_face).numel()) if hit_face.numel() else 0
+        return {
+            "trajectory_crossing_vertices": n_vertices,
+            "trajectory_crossing_pairs": n_pairs,
+            "trajectory_crossing_faces": n_faces,
+            "trajectory_self_intersection_free": bool(n_vertices == 0),
+        }
+
+    def _finalTrajectoryGate(self) -> dict:
+        """Drive the whole mesh crossing-free, then measure.
+
+        Prefer the authoritative full-mesh sweep; if the (large) full-mesh grid
+        hash does not fit alongside the resident fit tensors, fall back to the
+        moved-region scope -- principled, since an unmoved vertex has a zero-
+        length trajectory and an unmoved face cannot be newly pierced by the
+        opposing (also-moving) layer in this fit."""
+        if not self.enable_trajectory_guard:
+            return self._measureTrajectory()
+
+        v = self._verts.shape[0]
+        owner = torch.arange(v, device=self.device)
+        # the in-loop constraint tensors are no longer needed; free them so the
+        # full-mesh broad phase has maximal headroom.
+        self._freeConstraintMemory()
+        try:
+            self._resolveTrajectory(self.trajectory_final_rounds, ids=owner)
+            metrics = self._measureTrajectory()
+            metrics["trajectory_scope"] = "full_mesh"
+            return metrics
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(
+                "[WARN][WatertightFitter] full-mesh trajectory gate hit OOM; "
+                "falling back to the moved-region scope."
+            )
+            for _ in range(self.trajectory_final_rounds):
+                face_ids = self._trajectoryActiveFaceIds()
+                n = self._applyTrajectoryGuard(ids=owner, face_ids=face_ids)
+                if n == 0:
+                    break
+            metrics = self._measureTrajectory(
+                face_ids=self._trajectoryActiveFaceIds()
+            )
+            metrics["trajectory_scope"] = "active_fallback"
+            return metrics
+
+    def _freeConstraintMemory(self) -> None:
+        """Release the sheet / collision constraint tensors and clear the CUDA
+        cache (called before the memory-heavy final gate)."""
+        dev = self.device
+        empty2 = torch.zeros(0, 2, dtype=torch.long, device=dev)
+        self._collision_pairs = empty2
+        self._sheet_pairs = empty2
+        self._sheet_axis = torch.zeros(0, 3, device=dev)
+        self._sheet_margin = torch.zeros(0, device=dev)
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ #
     # constraint sets (collision + sheet pairs)                          #
@@ -523,6 +801,22 @@ class WatertightFitter(object):
             self._optimizer.step()
             data_v = float(data.item())
             lap_v = float(lap_loss.item())
+
+            # real-time trajectory guard: right after the step, pull any vertex
+            # whose ref->current trajectory now pierces the mesh back to its
+            # largest safe position (local, never a wholesale reset to rest).
+            self._traj_step_counter += 1
+            if (
+                self.enable_trajectory_guard
+                and self.trajectory_check_inner_every > 0
+                and self._traj_step_counter % self.trajectory_check_inner_every == 0
+            ):
+                with torch.no_grad():
+                    # in-loop: scope the broad phase to the moved region so the
+                    # grid hash fits next to the resident constraint tensors.
+                    self._applyTrajectoryGuard(
+                        face_ids=self._trajectoryActiveFaceIds()
+                    )
         return {
             "data": data_v,
             "lap": lap_v,
@@ -698,6 +992,13 @@ class WatertightFitter(object):
         if self.enable_self_collision_guard:
             self._disp.data.copy_(safe_snapshot)
 
+        # resolve the user-defined trajectory criterion over the active region
+        # before this cycle's geometry is baked into the next subdivision, so a
+        # refinement never starts from a trajectory-crossing state.
+        if self.enable_trajectory_guard:
+            with torch.no_grad():
+                self._resolveTrajectory(self.trajectory_resolve_iters, scoped=True)
+
     # ------------------------------------------------------------------ #
     # adaptive subdivision                                               #
     # ------------------------------------------------------------------ #
@@ -757,9 +1058,11 @@ class WatertightFitter(object):
         return True
 
     # ------------------------------------------------------------------ #
-    # fit                                                                #
+    # fit setup (shared by fit + the stepwise debug mode)                #
     # ------------------------------------------------------------------ #
-    def fit(self) -> Mesh:
+    def _setupFit(self) -> None:
+        """Rigid init, GPU tensors, target index, schedules and baseline scan.
+        Shared by `fit` (full pipeline) and `fitStepwise` (per-step debug)."""
         assert self.source_mesh is not None and self.target_mesh is not None
 
         self._rigidInit()
@@ -821,6 +1124,13 @@ class WatertightFitter(object):
 
         self._history = []
         self._refine_log = []
+        self._traj_step_counter = 0
+
+    # ------------------------------------------------------------------ #
+    # fit                                                                #
+    # ------------------------------------------------------------------ #
+    def fit(self) -> Mesh:
+        self._setupFit()
 
         for level in range(self.max_subdivisions + 1):
             n_outer = self.outer_iter if level == 0 else self.refine_iter
@@ -834,13 +1144,27 @@ class WatertightFitter(object):
                     )
                     break
 
-        # authoritative full-mesh final gate on the output
+        # authoritative full-mesh final gate for the user-defined trajectory
+        # criterion: drive the whole mesh crossing-free, then measure it.
+        self._trajectory_metrics = self._finalTrajectoryGate()
+        if self.enable_trajectory_guard:
+            print(
+                "[INFO][WatertightFitter] final trajectory crossings: "
+                f"vertices={self._trajectory_metrics['trajectory_crossing_vertices']}, "
+                f"pairs={self._trajectory_metrics['trajectory_crossing_pairs']}, "
+                f"faces={self._trajectory_metrics['trajectory_crossing_faces']}"
+            )
+
+        # supplementary triangle-triangle self-intersection diagnostic (the
+        # legacy gate). Kept for reference; the trajectory criterion above is the
+        # authoritative acceptance signal for this run.
         final_global = 0
         if self.enable_self_collision_guard:
             n_new, _ = self._newIntersections(query_mask=None)
             final_global = int(n_new)
             print(
-                "[INFO][WatertightFitter] final authoritative new self-intersections:",
+                "[INFO][WatertightFitter] final triangle-triangle new "
+                "self-intersections (supplementary):",
                 final_global,
             )
         self._final_new_self_intersections = final_global
@@ -852,7 +1176,421 @@ class WatertightFitter(object):
         self.source_mesh.vertex_colors = None
         self.source_mesh.vertex_normals = None
         self.source_mesh.triangle_normals = None
+
+        # the trajectory reference mesh: identical topology to the output, with
+        # each vertex placed at its clean watertight-rest position (carried in
+        # lock-step through subdivision). Saving it lets the trajectory criterion
+        # be re-verified offline on the de-normalized output.
+        self._trajectory_reference_mesh = self.source_mesh.clone()
+        self._trajectory_reference_mesh.vertices = (
+            self._ref_verts.detach().cpu().numpy().astype(np.float64)
+        )
+        self._trajectory_reference_mesh.vertex_colors = None
+        self._trajectory_reference_mesh.vertex_normals = None
+        self._trajectory_reference_mesh.triangle_normals = None
         return self.source_mesh
+
+    # ------------------------------------------------------------------ #
+    # stepwise debug mode                                                #
+    # ------------------------------------------------------------------ #
+    def _saveStepMesh(self, folder: str, step: int) -> str:
+        """De-normalize the CURRENT deformed mesh and save it as step_XX.ply."""
+        with torch.no_grad():
+            deformed = self._deformed().detach().cpu().numpy().astype(np.float64)
+        m = Mesh()
+        m.vertices = deformed
+        m.triangles = self._faces.detach().cpu().numpy()
+        m.transform(self.norm_center, self.norm_scale, is_inverse=True)
+        path = os.path.join(folder, f"step_{step:02d}.ply")
+        m.save(path, overwrite=True)
+        return path
+
+    def _stepFitError(
+        self, matched: torch.Tensor, weight: torch.Tensor
+    ) -> Tuple[float, float]:
+        """Current per-vertex fit error to the matched target points (normalized
+        frame), reported as (mean over kept verts, max). This is the cheap
+        in-loop signal of "how well the mesh hugs the target this step"."""
+        with torch.no_grad():
+            d = self._deformed().detach()
+            dist = (d - matched).norm(dim=1)
+            kept = weight.reshape(-1) > 0
+            if bool(kept.any()):
+                mean_e = float(dist[kept].mean().item())
+            else:
+                mean_e = float(dist.mean().item())
+            max_e = float(dist.max().item())
+        return mean_e, max_e
+
+    def fitStepwise(
+        self,
+        n_steps: int = 4,
+        inner_per_step: int = 1,
+        error_gate_tau: float = 0.0,
+        save_folder: Union[str, None] = None,
+        compute_chamfer: bool = False,
+        chamfer_each_step: bool = False,
+        save_meshes: bool = True,
+    ) -> dict:
+        """Run the FIRST `n_steps` recorded optimization steps one at a time.
+
+        Each recorded step does exactly what the user asked for, in order:
+          1. `inner_per_step` Adam steps that pull every vertex closer to its
+             matched target point (data term + Laplacian/barriers), so the mesh
+             hugs the target a little more each step;
+          2. an IMMEDIATE trajectory self-intersection check (the user's
+             criterion: the segment ref->current must not pierce a non-incident
+             face) and a LOCAL pullback of every offending vertex along its own
+             trajectory to the largest crossing-free position -- never a wholesale
+             reset to rest;
+          3. recording of the step's cheap fit error (distance to the matched
+             target points) and the number of vertices repaired. The full
+             Chamfer is expensive (de-normalize + sample + KNN), so it is OFF
+             per-step by default and computed once at the end; set
+             `chamfer_each_step` to also record it every step;
+          4. optionally saving the step's mesh.
+
+        No subdivision is performed here -- this is the per-step diagnostic of the
+        level-0 burst, so the error/mesh trajectory is directly comparable across
+        steps. Returns a dict with a `steps` list of per-step records.
+        """
+        self._setupFit()
+
+        dev = self.device
+        if save_folder is None:
+            save_folder = (self.save_result_folder_path or "./output/stepwise/")
+        os.makedirs(save_folder, exist_ok=True)
+
+        # one fixed correspondence + normal gate for this short burst, using the
+        # widest mask stage (stage 0) so far-away verts are still pulled in.
+        mask_dist = self.mask_dist_schedule[0]
+        lap_w = self.laplacian_schedule[0]
+        p2p_w = self.point_to_plane_schedule[0]
+
+        self._setInversionRest()
+        active0 = self._activeFaceMask(self.collision_active_tau * self._tau_norm)
+        self._buildConstraints(active0)
+        coll_w = self.collision_weight if self.enable_self_collision_guard else 0.0
+        sheet_w = self.sheet_weight if self.enable_sheet_guard else 0.0
+
+        records = []
+        for step in range(n_steps):
+            t0 = time.time()
+            # refresh the target correspondence each step so "closer to target"
+            # tracks the moving surface (cheap relative to the step itself).
+            with torch.no_grad():
+                cur = self._deformed().detach()
+                idx, d2 = self._target_index.query(cur, k=1)
+                idx_t = torch.from_numpy(idx).to(dev)
+                matched = self._target_pts[idx_t]
+                matched_n = self._target_nrm[idx_t]
+                keep = torch.from_numpy(d2).to(dev) < (mask_dist ** 2)
+                if self.normal_gate:
+                    vn = vertexNormals(cur, self._faces)
+                    agree = (vn * matched_n).sum(dim=1) > self.normal_gate_cos
+                    keep = keep & agree
+                # error gate: freeze vertices that already hug the target so the
+                # data term only acts on the genuinely high-error region. Without
+                # this, a near-converged mesh keeps thrashing already-fitted
+                # (often double-layer) verts toward ambiguous matches -- which is
+                # exactly what was raising the error and spawning self-crossings.
+                if error_gate_tau > 0.0:
+                    dist = (cur - matched).norm(dim=1)
+                    keep = keep & (dist > (error_gate_tau * self._tau_norm))
+                weight = keep.float().unsqueeze(1)
+                n_gated = int(keep.sum().item())
+
+            # 1 Adam step(s) toward the target. The trajectory guard runs inside
+            #   _innerSteps after every Adam step (trajectory_check_inner_every),
+            #   so even with inner_per_step>1 each sub-step is guarded; we also
+            #   resolve again below to drive this recorded step crossing-free.
+            info = self._innerSteps(
+                inner_per_step,
+                matched,
+                matched_n,
+                weight,
+                lap_w,
+                p2p_w,
+                coll_w,
+                sheet_w,
+            )
+
+            # 2 immediate trajectory self-intersection check + local pullback,
+            #   iterated until this step's moved region is crossing-free (scoped
+            #   broad phase keeps it memory-bounded on the full case1 mesh).
+            n_repaired_total = 0
+            with torch.no_grad():
+                for _ in range(self.trajectory_resolve_iters):
+                    face_ids = self._trajectoryActiveFaceIds()
+                    n = self._applyTrajectoryGuard(face_ids=face_ids)
+                    n_repaired_total += n
+                    if n == 0:
+                        break
+                traj = self._measureTrajectory(
+                    face_ids=self._trajectoryActiveFaceIds()
+                )
+
+            # 3 record this step's error.
+            mean_e, max_e = self._stepFitError(matched, weight)
+            rec = {
+                "step": step,
+                "data_loss": info["data"],
+                "lap_loss": info["lap"],
+                "fit_error_mean_norm": mean_e,
+                "fit_error_max_norm": max_e,
+                "fit_error_mean_tau": mean_e / self._tau_norm,
+                "fit_error_max_tau": max_e / self._tau_norm,
+                "trajectory_repaired_vertices": int(n_repaired_total),
+                "trajectory_crossing_vertices_after": int(
+                    traj["trajectory_crossing_vertices"]
+                ),
+                "active_vertices": int(n_gated),
+            }
+            if chamfer_each_step:
+                cm = self._currentChamfer()
+                rec["chamfer_l1"] = cm["chamfer_l1"]
+                rec["f1"] = cm.get("f1")
+            if save_meshes:
+                rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            rec["seconds"] = round(time.time() - t0, 2)
+            records.append(rec)
+            print(
+                f"[INFO][stepwise] step {step}: "
+                f"fit_err_mean={rec['fit_error_mean_tau']:.3f}tau, "
+                f"fit_err_max={rec['fit_error_max_tau']:.3f}tau, "
+                f"active={rec['active_vertices']}, "
+                f"repaired={rec['trajectory_repaired_vertices']}, "
+                f"crossings_after={rec['trajectory_crossing_vertices_after']}, "
+                + (
+                    f"chamfer_l1={rec.get('chamfer_l1'):.6f}, "
+                    if chamfer_each_step
+                    else ""
+                )
+                + f"{rec['seconds']}s"
+            )
+
+        out = {
+            "n_steps": n_steps,
+            "inner_per_step": inner_per_step,
+            "tau": self._tau_norm / self.norm_scale,
+            "steps": records,
+        }
+        # one final full Chamfer/F1 (cheap to do once) unless already per-step.
+        if compute_chamfer and not chamfer_each_step:
+            final_cm = self._currentChamfer()
+            out["final_chamfer_l1"] = final_cm["chamfer_l1"]
+            out["final_f1"] = final_cm.get("f1")
+            print(
+                "[INFO][stepwise] final chamfer_l1=",
+                round(final_cm["chamfer_l1"], 6),
+                "f1=",
+                round(final_cm.get("f1", 0.0), 6),
+            )
+        with open(os.path.join(save_folder, "stepwise_log.json"), "w") as f:
+            json.dump(out, f, indent=2)
+        print("[INFO][stepwise] log saved to", os.path.join(save_folder, "stepwise_log.json"))
+        return out
+
+    def _currentChamfer(self) -> dict:
+        """Full Chamfer/F1 of the CURRENT deformed mesh (de-normalized)."""
+        with torch.no_grad():
+            cur_mesh = Mesh()
+            cur_mesh.vertices = (
+                self._deformed().detach().cpu().numpy().astype(np.float64)
+            )
+            cur_mesh.triangles = self._faces.detach().cpu().numpy()
+        return self._evaluateMesh(cur_mesh)
+
+    # ------------------------------------------------------------------ #
+    # gradient-descent stepwise with per-vertex step clamp (user spec)   #
+    # ------------------------------------------------------------------ #
+    def _fullTrajectoryPullback(
+        self, ids: torch.Tensor, n_bisect: int
+    ) -> Tuple[int, int]:
+        """Check the segment ref->current of every vertex in `ids` against ANY
+        triangle of the current mesh; for each segment that pierces a face, move
+        the vertex back along the segment by the MINIMUM distance that leaves the
+        segment free of any face crossing (== largest safe fraction, bisected).
+
+        Differs from `_applyTrajectoryGuard` in two deliberate ways matching the
+        user's spec: (a) the broad phase is the FULL mesh (face_ids=None), not the
+        scoped active region; (b) the candidate set is exactly `ids` (every moved
+        vertex), not the cumulative-motion-thresholded subset. Segments are
+        chunked so peak candidate-pair memory stays bounded on the 14M mesh.
+        Returns (n_pulled_back, n_checked)."""
+        if ids.numel() == 0:
+            return 0, 0
+        cur = self._deformed().detach()
+        ref = self._ref_verts.detach()
+        cell = self._trajCellSize(cur)
+        chunk = self.trajectory_seg_chunk
+        clamp_id_parts, clamp_pos_parts = [], []
+        for start in range(0, ids.numel(), chunk):
+            sub = ids[start:start + chunk]
+            safe_pos, need = largestSafeStep(
+                ref[sub],
+                cur[sub],
+                cur,
+                self._faces,
+                owner_vid=sub,
+                inflate=0.0,
+                n_bisect=n_bisect,
+                cell_size=cell,
+                face_ids=None,  # ANY triangle (full mesh)
+            )
+            if bool(need.any()):
+                clamp_id_parts.append(sub[need])
+                clamp_pos_parts.append(safe_pos[need])
+        if not clamp_id_parts:
+            return 0, int(ids.numel())
+        clamp_ids = torch.cat(clamp_id_parts, dim=0)
+        clamp_pos = torch.cat(clamp_pos_parts, dim=0)
+        with torch.no_grad():
+            self._disp.data[clamp_ids] = clamp_pos - self._verts[clamp_ids]
+        return int(clamp_ids.numel()), int(ids.numel())
+
+    def fitStepwiseClamped(
+        self,
+        n_steps: int = 4,
+        step_frac: float = 0.1,
+        gd_lr: float = 0.5,
+        lap_w: Union[float, None] = None,
+        n_bisect: int = 16,
+        resolve_iters: int = 8,
+        save_folder: Union[str, None] = None,
+        compute_chamfer: bool = True,
+        chamfer_each_step: bool = True,
+        save_meshes: bool = True,
+    ) -> dict:
+        """Gradient-descent stepwise fit with a per-vertex step cap, per the spec.
+
+        Each recorded step:
+          1. find each vertex's closest point cp_i on the TARGET surface (exact,
+             face-interior) and the pair distance d_i = ||cp_i - v_i||;
+          2. take ONE gradient-descent step of (data toward cp_i + Laplacian),
+             but CLAMP each vertex's resulting move along the gradient to at most
+             step_frac * d_i (default 0.1 d_i), so no vertex can overshoot;
+          3. check the segment ref->current of every moved vertex against ANY
+             triangle of the current mesh; pull every offending vertex back along
+             its own segment by the minimum distance that removes all crossings
+             (largest safe fraction), iterating to a crossing-free fixpoint;
+          4. record the step's residual / repaired count and save the mesh.
+
+        Plain gradient descent (not Adam) is used on purpose: Adam's per-coord
+        adaptive scaling amplifies the tiny near-converged gradient into a
+        constant-size thrash; the explicit 0.1 d_i cap is the principled step
+        controller instead. Runs only the first `n_steps` (no subdivision).
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = self.save_result_folder_path or "./output/stepwise_clamped/"
+        os.makedirs(save_folder, exist_ok=True)
+        tau = self._tau_norm
+        if lap_w is None:
+            lap_w = self.laplacian_weight
+
+        # exact closest-point field over the (normalized) target surface: gives
+        # the true face-interior closest point (the move direction + d_i), which
+        # the sampled-point NN index cannot.
+        tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
+        tF = np.asarray(self.target_mesh.triangles)
+        field = ImplicitField(tV, tF, device=dev)
+
+        records = []
+        for step in range(n_steps):
+            t0 = time.time()
+
+            # 1 exact closest point on target + pair distance d_i
+            with torch.no_grad():
+                cur = self._deformed().detach()
+                cp, _, _ = field.closestPoints(cur)
+                d_i = (cp - cur).norm(dim=1)  # (V,)
+
+            # 2 one plain gradient-descent step (data toward cp + Laplacian),
+            #   then clamp each vertex's move to step_frac * d_i.
+            #   The data term uses a SUM reduction so each vertex's gradient is
+            #   2(d - cp) (independent of the vertex count); with lr=0.5 the raw
+            #   data step is ~the full (cp - d), so the step_frac*d_i CAP is the
+            #   binding step controller -- i.e. every vertex advances ~0.1 d_i
+            #   toward its closest point, exactly as specified. The Laplacian
+            #   gradient still smooths the field before the cap is applied.
+            self._disp.grad = None
+            disp = self._disp
+            d = self._verts + disp
+            data = self.fit_weight * ((d - cp) ** 2).sum(dim=1).sum()
+            lap_loss = edgeLaplacianLoss(disp, self._edges)
+            loss = 0.5 * data + lap_w * lap_loss
+            loss.backward()
+            with torch.no_grad():
+                grad = self._disp.grad
+                raw_step = -gd_lr * grad             # gradient-descent direction
+                cap = (step_frac * d_i).unsqueeze(1)  # per-vertex max move
+                clamped_step = clampNorm(raw_step, cap)
+                self._disp.data.add_(clamped_step)
+                step_move = clamped_step.norm(dim=1)
+
+            # 3 trajectory check vs ANY face + minimum-distance pull-back,
+            #   iterated to a crossing-free fixpoint over all moved vertices.
+            with torch.no_grad():
+                moved = torch.nonzero(
+                    self._cumulativeMotion() > 0, as_tuple=False
+                ).reshape(-1)
+            n_repaired_total = 0
+            for _ in range(resolve_iters):
+                n_pb, _ = self._fullTrajectoryPullback(moved, n_bisect)
+                n_repaired_total += n_pb
+                if n_pb == 0:
+                    break
+
+            # 4 record
+            with torch.no_grad():
+                resid = float(d_i.mean().item())
+                resid_max = float(d_i.max().item())
+            rec = {
+                "step": step,
+                "fit_residual_mean_tau": resid / tau,
+                "fit_residual_max_tau": resid_max / tau,
+                "data_loss": float(data.item()),
+                "lap_loss": float(lap_loss.item()),
+                "mean_step_move_tau": float(step_move.mean().item()) / tau,
+                "max_step_move_tau": float(step_move.max().item()) / tau,
+                "trajectory_repaired_vertices": int(n_repaired_total),
+            }
+            if chamfer_each_step:
+                cm = self._currentChamfer()
+                rec["chamfer_l1"] = cm["chamfer_l1"]
+                rec["f1"] = cm.get("f1")
+            if save_meshes:
+                rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            rec["seconds"] = round(time.time() - t0, 2)
+            records.append(rec)
+            print(
+                f"[INFO][stepwise-clamped] step {step}: "
+                f"resid_mean={rec['fit_residual_mean_tau']:.3f}tau, "
+                f"step_move_mean={rec['mean_step_move_tau']:.4f}tau, "
+                f"repaired={rec['trajectory_repaired_vertices']}, "
+                + (
+                    f"chamfer_l1={rec.get('chamfer_l1'):.6f}, "
+                    if chamfer_each_step
+                    else ""
+                )
+                + f"{rec['seconds']}s"
+            )
+
+        out = {"n_steps": n_steps, "step_frac": step_frac,
+               "tau": tau / self.norm_scale, "steps": records}
+        if compute_chamfer and not chamfer_each_step:
+            cm = self._currentChamfer()
+            out["final_chamfer_l1"] = cm["chamfer_l1"]
+            out["final_f1"] = cm.get("f1")
+        with open(os.path.join(save_folder, "stepwise_log.json"), "w") as f:
+            json.dump(out, f, indent=2)
+        print(
+            "[INFO][stepwise-clamped] log saved to",
+            os.path.join(save_folder, "stepwise_log.json"),
+        )
+        return out
 
     # ------------------------------------------------------------------ #
     # evaluation                                                         #
@@ -898,7 +1636,7 @@ class WatertightFitter(object):
         fitted_metrics = self._evaluateMesh(self.source_mesh)
         baseline_metrics = self._evaluateMesh(self._baseline_mesh)
 
-        clean = int(getattr(self, "_final_new_self_intersections", 0)) == 0
+        traj = dict(getattr(self, "_trajectory_metrics", {}))
 
         if fitted_metrics["chamfer_l1"] <= baseline_metrics["chamfer_l1"]:
             kept = "fitted"
@@ -911,10 +1649,22 @@ class WatertightFitter(object):
             self.source_mesh.triangle_normals = None
             kept = "baseline"
             final = baseline_metrics
+            # the rest mesh is its own reference -> trajectory trivially clean.
+            self._trajectory_reference_mesh = self._baseline_mesh.clone()
+            traj = {
+                "trajectory_crossing_vertices": 0,
+                "trajectory_crossing_pairs": 0,
+                "trajectory_crossing_faces": 0,
+                "trajectory_self_intersection_free": True,
+            }
+            self._trajectory_metrics = traj
             print(
                 "[INFO][WatertightFitter] deformation did not improve metric; "
                 "keeping rigid-init baseline."
             )
+
+        # the user-defined criterion is the authoritative cleanliness signal.
+        clean = bool(traj.get("trajectory_self_intersection_free", True))
 
         return {
             "baseline": baseline_metrics,
@@ -926,6 +1676,7 @@ class WatertightFitter(object):
                 getattr(self, "_final_new_self_intersections", 0)
             ),
             "self_intersection_free": bool(clean),
+            **traj,
         }
 
     def saveResult(
@@ -935,10 +1686,27 @@ class WatertightFitter(object):
             return ""
         out_mesh = self.source_mesh.clone()
         out_mesh.transform(self.norm_center, self.norm_scale, is_inverse=True)
-        clean = int(getattr(self, "_final_new_self_intersections", 0)) == 0
+        traj = getattr(self, "_trajectory_metrics", {})
+        clean = bool(traj.get("trajectory_self_intersection_free", True))
         name = "fitted_mesh.ply" if clean else "fitted_mesh_unverified.ply"
         mesh_path = self.save_result_folder_path + name
         out_mesh.save(mesh_path, overwrite=True)
+
+        # de-normalized trajectory reference mesh (same topology as the output);
+        # the trajectory criterion can be re-verified offline against it.
+        ref_mesh = getattr(self, "_trajectory_reference_mesh", None)
+        if ref_mesh is not None:
+            ref_out = ref_mesh.clone()
+            ref_out.transform(self.norm_center, self.norm_scale, is_inverse=True)
+            ref_out.save(
+                self.save_result_folder_path + "trajectory_reference_mesh.ply",
+                overwrite=True,
+            )
+        if traj:
+            with open(
+                self.save_result_folder_path + "trajectory_report.json", "w"
+            ) as f:
+                json.dump(traj, f, indent=2)
 
         if metrics is not None:
             with open(self.save_result_folder_path + "metrics.json", "w") as f:

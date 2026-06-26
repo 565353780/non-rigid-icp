@@ -48,6 +48,7 @@ def segmentMeshCandidates(
     inflate: float = 0.0,
     cell_size: Union[float, None] = None,
     pair_chunk: int = 40_000_000,
+    face_ids: Union[torch.Tensor, None] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Broad-phase (segment, triangle) candidate pairs, owner-1-ring excluded.
 
@@ -58,19 +59,29 @@ def segmentMeshCandidates(
             (the 1-ring, which legitimately share the moving endpoint) are
             dropped from the candidates.
         inflate: AABB inflation (small, for conservativeness).
+        cell_size: optional fixed grid cell size; caching it across calls (it is
+            tessellation-scale and stable within a topology) avoids the per-call
+            quantile estimate over the full triangle AABB set.
+        face_ids: optional (M,) subset of GLOBAL face ids to test against. The
+            returned `cand_tri` is always remapped back to GLOBAL ids, so the
+            narrow phase keeps using the full `faces`/`vertices`. The default
+            (None) tests against every face, which never misses a static
+            opposing sheet -- restrict only when the partner is provably inside
+            the subset (e.g. an already-dilated active region).
 
     Returns:
         cand_seg: (P,) local segment ids; cand_tri: (P,) global face ids.
     """
     device = faces.device
     s = seg_start.shape[0]
-    f = faces.shape[0]
+    local_faces = faces if face_ids is None else faces[face_ids]
+    f = local_faces.shape[0]
     if s == 0 or f == 0:
         z = torch.zeros(0, dtype=torch.long, device=device)
         return z, z
 
     seg_lo, seg_hi = _segment_aabbs(seg_start, seg_end, inflate)
-    tri_lo, tri_hi = triangleAABBs(vertices, faces, inflate)
+    tri_lo, tri_hi = triangleAABBs(vertices, local_faces, inflate)
 
     # Size the grid from the TRIANGLE boxes only. The combined list places the
     # (tiny, capped) segments first, and estimateCellSize samples the first 4M
@@ -106,10 +117,10 @@ def segmentMeshCandidates(
         if a.numel() == 0:
             continue
         seg_id = torch.where(a_seg, a, b)
-        tri_id = torch.where(a_seg, b, a) - s
+        tri_id = torch.where(a_seg, b, a) - s  # LOCAL index into local_faces
         # drop faces incident to the segment's owner vertex (the moving 1-ring)
         owner = owner_vid[seg_id]
-        incident = (faces[tri_id] == owner.unsqueeze(1)).any(dim=1)
+        incident = (local_faces[tri_id] == owner.unsqueeze(1)).any(dim=1)
         seg_id, tri_id = seg_id[~incident], tri_id[~incident]
         if seg_id.numel() == 0:
             continue
@@ -119,7 +130,11 @@ def segmentMeshCandidates(
     if not seg_parts:
         z = torch.zeros(0, dtype=torch.long, device=device)
         return z, z
-    return torch.cat(seg_parts, dim=0), torch.cat(tri_parts, dim=0)
+    cand_seg = torch.cat(seg_parts, dim=0)
+    cand_tri = torch.cat(tri_parts, dim=0)
+    if face_ids is not None:
+        cand_tri = face_ids[cand_tri]  # remap LOCAL -> GLOBAL
+    return cand_seg, cand_tri
 
 
 def _narrow_seg_hits(
@@ -151,6 +166,40 @@ def _narrow_seg_hits(
     return out
 
 
+def _narrow_seg_pairs(
+    seg_start: torch.Tensor,
+    seg_end: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    cand_seg: torch.Tensor,
+    cand_tri: torch.Tensor,
+    narrow_chunk: int = 8_000_000,
+) -> torch.Tensor:
+    """Per-candidate-pair bool: does this (segment, triangle) pair pierce?
+
+    Unlike `_narrow_seg_hits` (which collapses to a per-segment OR for the cheap
+    boolean / bisection path), this keeps the result aligned with the candidate
+    pair arrays so the caller can recover the exact (segment, face) hits."""
+    p = cand_seg.shape[0]
+    if p == 0:
+        return torch.zeros(0, dtype=torch.bool, device=faces.device)
+    out = torch.zeros(p, dtype=torch.bool, device=faces.device)
+    for start in range(0, p, narrow_chunk):
+        sl = slice(start, start + narrow_chunk)
+        cs = cand_seg[sl]
+        ct = cand_tri[sl]
+        tri = faces[ct]
+        hit = segmentTriangleIntersect(
+            seg_start[cs],
+            seg_end[cs],
+            vertices[tri[:, 0]],
+            vertices[tri[:, 1]],
+            vertices[tri[:, 2]],
+        )
+        out[sl] = hit
+    return out
+
+
 def segmentsCrossMesh(
     seg_start: torch.Tensor,
     seg_end: torch.Tensor,
@@ -158,14 +207,69 @@ def segmentsCrossMesh(
     faces: torch.Tensor,
     owner_vid: torch.Tensor,
     inflate: float = 0.0,
+    cell_size: Union[float, None] = None,
+    face_ids: Union[torch.Tensor, None] = None,
 ) -> torch.Tensor:
     """(S,) bool: does segment [start, end] pierce any non-incident face?"""
     cand_seg, cand_tri = segmentMeshCandidates(
-        seg_start, seg_end, vertices, faces, owner_vid, inflate=inflate
+        seg_start,
+        seg_end,
+        vertices,
+        faces,
+        owner_vid,
+        inflate=inflate,
+        cell_size=cell_size,
+        face_ids=face_ids,
     )
     return _narrow_seg_hits(
         seg_start, seg_end, vertices, faces, cand_seg, cand_tri, seg_start.shape[0]
     )
+
+
+def segmentMeshIntersections(
+    seg_start: torch.Tensor,
+    seg_end: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    owner_vid: torch.Tensor,
+    inflate: float = 0.0,
+    cell_size: Union[float, None] = None,
+    face_ids: Union[torch.Tensor, None] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Detailed segment-mesh crossings.
+
+    This is the authoritative form of the user's self-intersection criterion: a
+    fitted vertex's straight trajectory from its watertight-rest position
+    (`seg_start`) to its current fitted position (`seg_end`) must not pierce any
+    non-incident face of the current mesh.
+
+    Returns:
+        hit_seg: (P,) local segment ids that pierced a face.
+        hit_face: (P,) GLOBAL face ids each `hit_seg` pierced (paired arrays).
+        crossed: (S,) bool, True where the segment pierced at least one face.
+    """
+    s = seg_start.shape[0]
+    z = torch.zeros(0, dtype=torch.long, device=faces.device)
+    crossed = torch.zeros(s, dtype=torch.bool, device=faces.device)
+    cand_seg, cand_tri = segmentMeshCandidates(
+        seg_start,
+        seg_end,
+        vertices,
+        faces,
+        owner_vid,
+        inflate=inflate,
+        cell_size=cell_size,
+        face_ids=face_ids,
+    )
+    if cand_seg.numel() == 0:
+        return z, z, crossed
+    pair_hit = _narrow_seg_pairs(
+        seg_start, seg_end, vertices, faces, cand_seg, cand_tri
+    )
+    hit_seg = cand_seg[pair_hit]
+    hit_face = cand_tri[pair_hit]
+    crossed[hit_seg] = True
+    return hit_seg, hit_face, crossed
 
 
 def largestSafeStep(
@@ -176,26 +280,48 @@ def largestSafeStep(
     owner_vid: torch.Tensor,
     inflate: float = 0.0,
     n_bisect: int = 6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cell_size: Union[float, None] = None,
+    face_ids: Union[torch.Tensor, None] = None,
+    return_hits: bool = False,
+):
     """Largest safe position along [ref, proposed] (per segment).
 
     Returns:
         safe_pos: (S, 3) = ref + alpha * (proposed - ref), alpha the largest
             tested fraction whose segment pierces no non-incident face.
         clamped: (S,) bool, True where alpha < 1 (the step was pulled back).
+        (if return_hits) hit_seg, hit_face: the (segment, GLOBAL face) pairs that
+            the FULL ref->proposed trajectory pierced -- the offending region the
+            caller can feed back into a barrier.
     """
     s = ref.shape[0]
+    z = torch.zeros(0, dtype=torch.long, device=faces.device)
     if s == 0:
-        return proposed, torch.zeros(0, dtype=torch.bool, device=faces.device)
+        empty_bool = torch.zeros(0, dtype=torch.bool, device=faces.device)
+        if return_hits:
+            return proposed, empty_bool, z, z
+        return proposed, empty_bool
 
     cand_seg, cand_tri = segmentMeshCandidates(
-        ref, proposed, vertices, faces, owner_vid, inflate=inflate
+        ref,
+        proposed,
+        vertices,
+        faces,
+        owner_vid,
+        inflate=inflate,
+        cell_size=cell_size,
+        face_ids=face_ids,
     )
-    full_hit = _narrow_seg_hits(
-        ref, proposed, vertices, faces, cand_seg, cand_tri, s
-    )
+    pair_hit = _narrow_seg_pairs(ref, proposed, vertices, faces, cand_seg, cand_tri)
+    full_hit = torch.zeros(s, dtype=torch.bool, device=faces.device)
+    if cand_seg.numel() > 0:
+        full_hit[cand_seg[pair_hit]] = True
+
     if not bool(full_hit.any()):
-        return proposed, torch.zeros(s, dtype=torch.bool, device=faces.device)
+        empty_bool = torch.zeros(s, dtype=torch.bool, device=ref.device)
+        if return_hits:
+            return proposed, empty_bool, z, z
+        return proposed, empty_bool
 
     # only the crossing segments need bisection; restrict candidates to them
     need = full_hit
@@ -214,4 +340,6 @@ def largestSafeStep(
 
     alpha = torch.where(need, lo, torch.ones_like(lo))
     safe_pos = ref + alpha.unsqueeze(1) * direction
+    if return_hits:
+        return safe_pos, need, cand_seg[pair_hit], cand_tri[pair_hit]
     return safe_pos, need
