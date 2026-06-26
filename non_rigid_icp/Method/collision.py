@@ -2,9 +2,12 @@
 
 Two-phase, scalable to tens of millions of faces:
 
-  broad phase  - centroid k-NN (reusing the GPU spatial index) yields a small
-                 set of geometrically-near, topologically-non-adjacent face
-                 pairs (a fold brings opposing sheets within k nearest).
+  broad phase  - inflated-AABB grid hash (Method/spatial_hash.py). Unlike a
+                 centroid k-NN broad phase, this is *complete*: every pair of
+                 triangles whose (margin-inflated) AABBs overlap is generated,
+                 so the opposing sheet of a thin / double-layer structure can
+                 never be missed because same-sheet neighbours filled the k
+                 slots. Scoped to a moved/active region via `query_mask`.
   narrow phase - exact triangle-triangle intersection / distance on that small
                  candidate set (vectorized, see Method/geometry.py).
 
@@ -22,6 +25,13 @@ from non_rigid_icp.Method.geometry import (
     triangleTriangleDistance2,
 )
 from non_rigid_icp.Method.topology import facePairsShareVertex
+from non_rigid_icp.Method.spatial_hash import (
+    triangleAABBs,
+    estimateCellSize,
+    buildCellIncidences,
+    cellPairChunk,
+    aabbOverlap,
+)
 
 
 def triangleCentroidsAndRadii(
@@ -127,6 +137,131 @@ def buildCollisionCandidates(
 
     pairs = torch.cat(collected, dim=0)
     pairs = torch.unique(pairs, dim=0)
+    return pairs
+
+
+def buildCollisionCandidatesAABB(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    margin: float = 0.0,
+    active_face_mask: Union[torch.Tensor, None] = None,
+    cell_size: Union[float, None] = None,
+    pair_chunk: int = 40_000_000,
+    max_pairs: Union[int, None] = None,
+    restrict_incidences_to_active: bool = True,
+) -> torch.Tensor:
+    """Broad-phase candidate face pairs via an inflated-AABB grid hash.
+
+    Replaces the centroid k-NN broad phase. Every pair of triangles whose AABBs
+    (each inflated by `margin`) overlap is a candidate, then topologically
+    adjacent (shared-vertex) pairs are dropped.
+
+    `active_face_mask` scopes the work to the moved region. With
+    `restrict_incidences_to_active` (default) the grid is built over ONLY the
+    active faces, so peak memory is bounded by the active count rather than the
+    full (tens-of-millions) face count -- essential for the refined meshes. This
+    finds active-vs-active crossings (a collapsing double layer moves BOTH its
+    sheets, so both are active); the rare active-vs-static crossing is caught by
+    the full-mesh authoritative gate. With the flag False the grid is built over
+    all faces and pairs are then filtered to those touching the active region.
+
+    Args:
+        margin: AABB inflation; use the barrier margin so the candidate set also
+            includes not-yet-touching pairs the barrier must act on.
+        max_pairs: optional cap (keeps the closest pairs by centroid distance).
+
+    Returns:
+        pairs: (P, 2) long, a < b, de-duplicated, non-adjacent (global face ids).
+    """
+    device = faces.device
+    if (
+        active_face_mask is not None
+        and restrict_incidences_to_active
+        and bool(active_face_mask.any())
+    ):
+        act_ids = torch.nonzero(active_face_mask, as_tuple=False).reshape(-1)
+        sub_faces = faces[act_ids]
+        lo, hi = triangleAABBs(vertices, sub_faces, margin)
+        local_to_global = act_ids
+        index_faces = sub_faces
+        active_filter = None  # all sub-pairs already touch the active region
+    else:
+        lo, hi = triangleAABBs(vertices, faces, margin)
+        local_to_global = None
+        index_faces = faces
+        active_filter = active_face_mask
+
+    if cell_size is None:
+        cell_size = estimateCellSize(lo, hi, quantile=0.9, factor=1.0)
+        if margin > 0:
+            cell_size = max(cell_size, 2.0 * margin)
+
+    # centroids in the SAME index space as the streamed pairs, for the
+    # distance-based reservoir prune (cheap to keep resident).
+    centroids_idx = vertices.detach()[index_faces].mean(dim=1)
+
+    def _consolidate(pr_cat: torch.Tensor) -> torch.Tensor:
+        pr_u = torch.unique(pr_cat, dim=0)
+        if max_pairs is not None and pr_u.shape[0] > max_pairs:
+            cd = (
+                (centroids_idx[pr_u[:, 0]] - centroids_idx[pr_u[:, 1]])
+                .pow(2)
+                .sum(dim=-1)
+            )
+            keep = torch.topk(cd, max_pairs, largest=False).indices
+            pr_u = pr_u[keep]
+        return pr_u
+
+    # Dense double layers can yield BILLIONS of within-cell candidate pairs, so
+    # the survivors are merged into a bounded reservoir during streaming rather
+    # than concatenated at the end (which would OOM). `acc` stays <= max_pairs;
+    # `pending` is flushed once it grows past the flush threshold.
+    flush_at = max(max_pairs, 20_000_000) if max_pairs is not None else 60_000_000
+    tri_sorted, pair_off, total_pairs = buildCellIncidences(lo, hi, cell_size)
+    acc: Union[torch.Tensor, None] = None
+    pending: list = []
+    pending_n = 0
+    for start in range(0, total_pairs, pair_chunk):
+        count = min(pair_chunk, total_pairs - start)
+        a, b = cellPairChunk(tri_sorted, pair_off, start, count)
+        keep = a != b
+        a, b = a[keep], b[keep]
+        if a.numel() == 0:
+            continue
+        ov = aabbOverlap(lo, hi, a, b)
+        a, b = a[ov], b[ov]
+        if a.numel() == 0:
+            continue
+        pr = torch.stack([torch.minimum(a, b), torch.maximum(a, b)], dim=1)
+        pr = torch.unique(pr, dim=0)
+        if active_filter is not None:
+            sel = active_filter[pr[:, 0]] | active_filter[pr[:, 1]]
+            pr = pr[sel]
+            if pr.numel() == 0:
+                continue
+        # adjacency test must use the same index space as `pr`
+        shared = facePairsShareVertex(pr, index_faces)
+        pr = pr[~shared]
+        if pr.numel() == 0:
+            continue
+        pending.append(pr)
+        pending_n += pr.shape[0]
+        if pending_n >= flush_at:
+            parts = pending if acc is None else ([acc] + pending)
+            acc = _consolidate(torch.cat(parts, dim=0))
+            pending = []
+            pending_n = 0
+
+    if pending:
+        parts = pending if acc is None else ([acc] + pending)
+        acc = _consolidate(torch.cat(parts, dim=0))
+    if acc is None or acc.shape[0] == 0:
+        return torch.zeros(0, 2, dtype=torch.long, device=device)
+    pairs = acc
+
+    if local_to_global is not None:
+        pairs = local_to_global[pairs]
+        pairs = torch.sort(pairs, dim=1).values
     return pairs
 
 

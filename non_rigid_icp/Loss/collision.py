@@ -38,4 +38,7 @@ def selfCollisionBarrierLoss(
     dist2 = triangleTriangleDistance2(tri1, tri2)
     dist = torch.sqrt(dist2 + 1e-18)
     viol = torch.clamp(margin - dist, min=0.0)
-    return (viol ** 2).mean()
+    # Normalize by the violating count (not the full candidate set) so the
+    # per-pair barrier force does not vanish when most candidates are still safe.
+    n_active = (viol > 0).sum().clamp(min=1).to(viol.dtype)
+    return (viol ** 2).sum() / n_active

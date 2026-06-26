@@ -255,6 +255,100 @@ CUDA_VISIBLE_DEVICES=2 python -m non_rigid_icp.Eval.evaluate_case1 \
 （F1 0.4868 → 0.4879、chamfer_l1 0.0010591 → 0.0010574），且**额外保证了全程无新增自交**。
 独立评估脚本（`output/case1_refine/eval_standalone.json`）复现一致：F1 = 0.4885、chamfer_l1 = 0.0010566。
 
+---
+
+## 12. 方法五：隐式场投影（ProjectionFitter，探索性对照）
+
+> 这是对“**不做优化、不做 IPC、不做 ARAP**，改用隐式场最近点投影”的一次完整探索与对照实现，
+> 与上文优化式的 `WatertightFitter`（v4）**完全独立、可并行对比**。结论先行：在 case1 这种
+> **以薄壁/双层结构为主**的数据上，本方法可以**硬保证输出零新增自交**，但拟合精度明显不如 v4，
+> 因此 **v4 仍是推荐版本**；本节记录其原理、实现与“为什么在此数据上不占优”的量化证据。
+
+### 12.1 第一性原理
+
+水密网格（source）已与原始网格（target）极接近，理论上无需带屏障的梯度优化，直接把每个顶点
+**投影到 target 的隐式零等值面**即可：
+
+- 对精确三角网格 SDF，最近点 `cp = compute_closest_points(v)` 恰等于一步 Newton 落面
+  `v' = v − φ(v)∇φ(v)`；`compute_signed_distance`（winding 符号）给出内外判定。
+- 用**步长上限** `||v'−v|| ≤ τ_step` 让单步极小、不越层。
+
+自交则用两条机制守护，再叠加一个可证收敛的硬门控：
+
+1. **逐顶点壁厚步长上限**：薄壁顶点单步收紧到 `thickness_frac · 局部壁厚`，使一次 sweep 不可能
+   穿过一面 0.16τ 的薄壁（固定 1τ 步会跨越数个壁宽、令守护失效）。
+2. **内向位移累计上限（inward-component cap）**：薄壁塌缩=两层沿法向相互靠拢。只对“朝向对侧层”
+   的位移分量设累计上限 `allowance=(壁厚−gap_margin)/2`（从 rest 起算），切向滑动与**远离对侧层**
+   的平移完全自由——既挡塌缩、又不破坏有益的整体平移。
+3. **轨迹不穿越守护（用户核心思想）**：顶点在水密网格上的 rest 位置 `ref_v` 到提议位置 `v'` 的连线
+   不得穿过当前网格任何非关联面；穿越者沿 `[ref_v, v']` 二分回退到最大安全步。细分中点的
+   `ref_v` = 两父 rest 顶点中点（天然落在水密网格边上），故不变量在细分后依旧成立。
+4. **权威终门控（硬保证、可证收敛）**：全网格 `findSelfIntersections − baseline(ref)` 扫描新增自交；
+   将涉及自交的顶点**直接 pin 回 rest** 并按边图**膨胀若干环**形成“rest 缓冲带”。pin 集合单调增长，
+   极限即整网回到无自交的 rest 配置，故新增自交数**单调收敛到 0**（实测 case1 第 16 轮归零）。
+   单纯“向 rest 折半回退”不收敛（渐近而不到达，残留少量自交）；改为 pin-to-rest + 环膨胀后
+   几轮即清零。
+
+主流程：`normalize → 刚性 ICP → 构建 ImplicitField(target) → [ 投影 sweep 到平台期 → 误差定位
+→ 局部保形细分(携带 ref 场) ]×K → 权威终门控 → 反归一化评估`。
+
+### 12.2 新增原子函数与模块（高度可复用）
+
+- `Method/implicit_field.py::ImplicitField`：封装 Open3D `RaycastingScene`（Embree，精确），
+  暴露 `closestPoints / signedDistance / project`，千万级查询分块流式处理。通用投影算子。
+- `Method/geometry.py::segmentTriangleIntersect`：Möller–Trumbore 段-三角向量化相交（补齐了几何核里
+  唯独缺失的“段-三角”）。
+- `Method/trajectory_guard.py`：`segmentsCrossMesh`（复用 `spatial_hash` 段/三角 AABB 栅格哈希流式粗筛
+  + 排 1-ring + 段-三角精算）与 `largestSafeStep`（沿轨迹二分取最大安全步）。
+- `Method/thickness.py`：法向射线 `faceWallPartnerDir / vertexWallPartner`（逐顶点壁厚 + 指向对侧层
+  的单位方向）与 `inwardComponentCap`（内向位移累计上限）。
+- `Module/projection_fitter.py::ProjectionFitter`：编排上述全部，对外 API 与 `WatertightFitter` 对齐
+  （`loadMeshes/fit/fitAndEvaluate/evaluate/saveResult`），复用归一化、误差定位、保形细分、评估与保存；
+  **无 optimizer、无 barrier loss**。
+- 入口与测试：`Demo/projection_fitter.py`、`Test/test_projection_fitter.py`（段-三角/轨迹守护/壁厚与
+  内向上限/细分携带 rest 场原子单测 + 合成双层壳端到端：未防护必塌缩自交、加防护后零自交且优于刚性基线）。
+
+### 12.3 case1 结果（flux 环境，CUDA_VISIBLE_DEVICES=2，2M 采样，同种子）
+
+> 命令：`python -c "from non_rigid_icp.Demo.projection_fitter import demo; demo(save_result_folder_path='./output/case1_proj3/')"`；
+> 总耗时（拟合 + 评估）≈ **1151s**（A800-80GB）。输出 `output/case1_proj3/fitted_mesh.ply`（已校验无自交）。
+
+| 版本 | F1@(L/2048) | precision | recall | chamfer_l1 | chamfer_l2 | 顶点/面 | 新增自交 |
+|---|---|---|---|---|---|---|---|
+| 刚性基线 | 0.4509 | 0.4506 | 0.4513 | 0.0011088 | 7.565e-7 | 14.45M / 28.91M | 0 |
+| **v4 + 守护 + K=4 细分**（推荐） | **0.4879** | 0.4881 | 0.4877 | **0.0010574** | 7.117e-7 | 23.38M / 46.77M | **0** |
+| 方法五：隐式场投影（本节） | 0.4571 | 0.4564 | 0.4578 | 0.0010991 | 7.486e-7 | 26.43M / 52.86M | **0** |
+
+四轮自适应细分后 28.91M → 52.86M 面；终门控为达到**零新增自交**，把 **≈1495 万 / 2643 万顶点（约 57%）
+pin 回 rest**——这正是精度受限的直接原因。
+
+### 12.4 结论：为什么方法五在此数据上不占优
+
+- **薄壁主导**：case1 水密网格逐顶点壁厚**中位仅 0.16–0.19τ**（远小于评估阈值 τ）。这些薄壁/双层结构
+  几乎遍布全网（14.4M/14.45M 顶点被判为壁面）。
+- **最近点投影对双层天生塌缩**：双层的两片都会被拉向同一目标表面而相互贴合→共面/穿插。内向上限、
+  逐顶点步长、轨迹守护只能抑制主导穿透，**无法在 0.16τ 尺度上根除所有自交**；真正的“零自交”靠终门控。
+- **零自交的代价**：要硬保证零自交，约 **57% 顶点必须回退到水密 rest**，于是结果只比刚性基线略好
+  （F1 0.4509 → 0.4571、chamfer_l1 −0.9%），**明显低于 v4（F1 0.4879）**。
+- **v4 已同时满足两点**：第 7、11 节表明优化式 v4 + 自交守护 + 细分**既拟合更好（F1 0.4879）又零新增自交**。
+  因此在该数据上 v4 占优，方法五作为对照保留。
+- **方法五更适合的场景**：target 为**单层/厚壁**、source 与 target 近似一一层对应、或仅需把 source
+  “吸附”到干净隐式面且无双层歧义时——此时无需优化即可快速、稳健、零自交地投影贴合。
+
+### 12.5 复现
+
+```bash
+cd /home/lichanghao/github/Watertight/non-rigid-icp
+export PATH=/vepfs-cnbja62d5d769987/lichanghao/miniconda3/envs/flux/bin:$PATH
+CUDA_VISIBLE_DEVICES=2 python -m non_rigid_icp.Test.test_projection_fitter   # 原子单测 + 合成双层壳端到端
+CUDA_VISIBLE_DEVICES=2 python -c "from non_rigid_icp.Demo.projection_fitter import demo; \
+  demo(save_result_folder_path='./output/case1_proj/')"
+```
+
+输出 `fitted_mesh.ply`（`self_intersection_free=True` 时）或 `fitted_mesh_unverified.ply`（未达零自交时），
+连同 `metrics.json / config.json / history.json / refine_log.json`。`metrics.json` 含
+`final_new_self_intersections`（推荐配置下为 0）与 `self_intersection_free`。
+
 四轮自适应细分（`refine_log.json`，每轮标记面均落在 `max_refine_faces=1.5M` 上限内，增长受控）：
 
 | 轮次 | 标记面数 | 面：before → after | 顶点：before → after | 阈值 | 该区最大面误差 |

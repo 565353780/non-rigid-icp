@@ -17,6 +17,24 @@ def _dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1)
 
 
+def vertexNormals(vertices: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+    """Area-weighted per-vertex normals for a consistently-wound mesh.
+
+    Args:
+        vertices: (V, 3); faces: (F, 3) long, consistent winding.
+
+    Returns:
+        (V, 3) unit normals (zero for isolated vertices). The raw cross product
+        is area-weighted (its magnitude is twice the face area), so larger faces
+        dominate, matching the usual angle/area-weighted vertex normal.
+    """
+    tri = vertices[faces]
+    fn = torch.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=-1)
+    vn = torch.zeros_like(vertices)
+    vn.index_add_(0, faces.reshape(-1), fn.repeat_interleave(3, dim=0))
+    return vn / (vn.norm(dim=1, keepdim=True) + EPS)
+
+
 def closestPointOnSegment(
     p: torch.Tensor, a: torch.Tensor, b: torch.Tensor
 ) -> torch.Tensor:
@@ -151,6 +169,51 @@ def triangleTriangleDistance2(tri1: torch.Tensor, tri2: torch.Tensor) -> torch.T
         for p2, q2 in edges2:
             d = torch.minimum(d, segmentSegmentDistance2(p1, q1, p2, q2))
     return d
+
+
+def segmentTriangleIntersect(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    """Boolean test whether segment [p, q] pierces triangle (a, b, c).
+
+    Vectorized Moller-Trumbore: the segment is p + t*(q - p), t in [0, 1]. A pair
+    counts as a hit when the line crosses the triangle interior (barycentric u, v
+    in range) within the segment extent. Parallel / coplanar segments (|det| <
+    eps) are reported as NON-intersecting -- a coplanar segment does not *pierce*
+    the sheet, and treating it as a hit would reject many legitimate in-plane
+    moves. This is exactly the primitive the trajectory guard needs: "does the
+    vertex's displacement segment tunnel through another face?"
+
+    All inputs are (P, 3). Returns (P,) bool.
+    """
+    if p.shape[0] == 0:
+        return torch.zeros(0, dtype=torch.bool, device=p.device)
+    d = q - p
+    e1 = b - a
+    e2 = c - a
+    pvec = torch.cross(d, e2, dim=-1)
+    det = _dot(e1, pvec)
+    parallel = det.abs() < eps
+    inv_det = 1.0 / torch.where(parallel, torch.ones_like(det), det)
+    tvec = p - a
+    u = _dot(tvec, pvec) * inv_det
+    qvec = torch.cross(tvec, e1, dim=-1)
+    v = _dot(d, qvec) * inv_det
+    t = _dot(e2, qvec) * inv_det
+    hit = (
+        (~parallel)
+        & (u >= -eps)
+        & (v >= -eps)
+        & (u + v <= 1.0 + eps)
+        & (t >= -eps)
+        & (t <= 1.0 + eps)
+    )
+    return hit
 
 
 def _signed_distances_to_plane(

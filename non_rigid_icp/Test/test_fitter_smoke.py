@@ -35,6 +35,9 @@ def main():
     source_mesh = Mesh.from_o3d(source_o3d)
     target_mesh = Mesh.from_o3d(target_o3d)
 
+    # the sphere->ellipsoid deformation is many tau, so use a coarse outlier mask
+    # schedule (the default tau-relative schedule is tuned for sources already
+    # within ~16 tau of the target, like the watertight case).
     fitter = WatertightFitter(
         device="cuda",
         outer_iter=20,
@@ -44,9 +47,11 @@ def main():
         train_target_samples=120000,
         eval_samples=120000,
         laplacian_weight=20.0,
+        mask_dist_schedule=[0.5, 0.3, 0.2, 0.1, 0.05],
         enable_self_collision_guard=True,
         collision_weight=50.0,
         collision_refresh_every=3,
+        collision_check_every=3,
         max_subdivisions=2,
         refine_iter=10,
         plateau_window=3,

@@ -12,7 +12,7 @@ unique-edge pass (the same one the fitter already performs).
 """
 
 import torch
-from typing import Tuple
+from typing import Tuple, List, Union
 
 # child triangulation templates keyed by the 3-bit marked-edge code
 # bit0 = edge(i0,i1), bit1 = edge(i1,i2), bit2 = edge(i2,i0)
@@ -57,6 +57,7 @@ def subdivideMarkedFaces(
     vertices: torch.Tensor,
     faces: torch.Tensor,
     region_mask: torch.Tensor,
+    extra_vertex_attrs: Union[List[torch.Tensor], None] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Conformingly subdivide the faces in `region_mask`.
 
@@ -64,6 +65,10 @@ def subdivideMarkedFaces(
         vertices: (V, 3) float tensor (the current/deformed base positions).
         faces: (F, 3) long tensor.
         region_mask: (F,) bool, faces to refine.
+        extra_vertex_attrs: optional list of (V, C) tensors carried through the
+            refinement (new midpoint rows = average of the two edge endpoints).
+            Used to keep e.g. a clean-reference vertex field in lock-step with
+            the deformed vertices so cumulative motion stays well-defined.
 
     Returns:
         new_vertices: (V + M, 3), original vertices unchanged, M new midpoints
@@ -71,6 +76,9 @@ def subdivideMarkedFaces(
             preserving and the displacement can simply restart from zero).
         new_faces: (F', 3) long.
         parents: (F',) long, original face id each child came from.
+
+    If `extra_vertex_attrs` is given, returns
+    (new_vertices, new_faces, parents, new_extra_attrs_list) instead.
     """
     device = faces.device
     v = vertices.shape[0]
@@ -78,6 +86,8 @@ def subdivideMarkedFaces(
 
     if region_mask.sum() == 0:
         parents = torch.arange(f, device=device)
+        if extra_vertex_attrs is not None:
+            return vertices, faces, parents, list(extra_vertex_attrs)
         return vertices, faces, parents
 
     unique_edges, face_edge_idx = buildFaceEdgeIndex(faces)
@@ -93,10 +103,17 @@ def subdivideMarkedFaces(
     midpoint_id = torch.full((e,), -1, dtype=torch.long, device=device)
     midpoint_id[marked_idx] = v + torch.arange(n_marked, device=device)
 
-    mid_pos = 0.5 * (
-        vertices[unique_edges[marked_idx, 0]] + vertices[unique_edges[marked_idx, 1]]
-    )
+    e0 = unique_edges[marked_idx, 0]
+    e1 = unique_edges[marked_idx, 1]
+    mid_pos = 0.5 * (vertices[e0] + vertices[e1])
     new_vertices = torch.cat([vertices, mid_pos], dim=0)
+
+    new_extra = None
+    if extra_vertex_attrs is not None:
+        new_extra = [
+            torch.cat([attr, 0.5 * (attr[e0] + attr[e1])], dim=0)
+            for attr in extra_vertex_attrs
+        ]
 
     m = midpoint_id[face_edge_idx]  # (F, 3), -1 where edge unmarked
     me = marked_edge[face_edge_idx]  # (F, 3) bool
@@ -120,4 +137,6 @@ def subdivideMarkedFaces(
 
     new_faces = torch.cat(new_faces_list, dim=0)
     parents = torch.cat(parent_list, dim=0)
+    if extra_vertex_attrs is not None:
+        return new_vertices, new_faces, parents, new_extra
     return new_vertices, new_faces, parents
