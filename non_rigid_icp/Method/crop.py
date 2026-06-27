@@ -85,3 +85,57 @@ def cropMeshByBBox(
     else:
         sub_faces = kept_faces.reshape(0, 3)
     return sub_vertices, sub_faces, vert_keep, face_keep
+
+
+def cropMeshToBBoxUnion(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    boxes,
+    mode: str = "all",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop a mesh to the UNION of several axis-aligned boxes.
+
+    A face is kept if it passes `cropMeshByBBox`'s `mode` test for ANY box, then
+    the surviving faces are re-indexed once into a single compact sub-mesh. This
+    is the atomic primitive behind the optional pre-fit crop: it shrinks a huge
+    mesh to just the regions of interest while leaving each region exactly as the
+    full-mesh run would see it (same box, same `mode`).
+
+    Args:
+        vertices: (V, 3) float array.
+        faces:    (F, 3) int array.
+        boxes:    iterable of (center(3,), edge(scalar|(3,))) pairs, all in the
+                  SAME coordinate frame as `vertices`.
+        mode:     'all' (strict containment) or 'centroid' (see cropMeshByBBox).
+
+    Returns:
+        sub_vertices: (V', 3) retained, re-indexed vertices.
+        sub_faces:    (F', 3) re-indexed into `sub_vertices`.
+    """
+    v = np.asarray(vertices)
+    f = np.asarray(faces).astype(np.int64)
+    if f.shape[0] == 0:
+        return v[:0], f.reshape(0, 3)
+
+    face_keep = np.zeros(f.shape[0], dtype=bool)
+    for center, edge in boxes:
+        lo, hi = bboxFromCenterEdge(center, edge)
+        if mode == "centroid":
+            cen = v[f].mean(axis=1)
+            keep = ((cen >= lo) & (cen <= hi)).all(axis=1)
+        else:  # 'all' (strict containment)
+            vin = verticesInBBox(v, lo, hi)
+            keep = vin[f].all(axis=1)
+        face_keep |= keep
+
+    kept_faces = f[face_keep]
+    vert_keep = np.zeros(v.shape[0], dtype=bool)
+    if kept_faces.shape[0] > 0:
+        vert_keep[kept_faces.reshape(-1)] = True
+    remap = -np.ones(v.shape[0], dtype=np.int64)
+    remap[vert_keep] = np.arange(int(vert_keep.sum()))
+    sub_vertices = v[vert_keep]
+    sub_faces = (
+        remap[kept_faces] if kept_faces.shape[0] > 0 else kept_faces.reshape(0, 3)
+    )
+    return sub_vertices, sub_faces

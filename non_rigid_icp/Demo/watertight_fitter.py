@@ -276,25 +276,53 @@ def demo_stepwise(
 
 def demo_stepwise_clamped(
     data_id: str = "watertight_case1",
-    n_steps: int = 20,
-    step_frac: float = 0.1,
-    gd_lr: float = 0.5,
+    # The per-vertex cap step_frac*d_i makes the mean residual decay as
+    # (1-step_frac)^n -- step_frac is literally the fraction of the way each
+    # vertex jumps toward its exact closest point on the target. A full sweep on
+    # the ROI-cropped case1 (Test/exp_step_frac_sweep.py, step_frac in
+    # [0.1..2.0] with gd_lr=2*step_frac so the cap, not the raw GD step, is the
+    # limiter) located the stability ceiling exactly:
+    #   * step_frac <= 1.0 : STABLE -- 0 self-intersection repairs, F1 climbs
+    #       monotonically to its ceiling (~0.818/0.727), residual -> ~0.
+    #   * step_frac == 1.0 : OPTIMUM -- one-shot projection: residual collapses
+    #       0.221tau -> 0.000tau in a SINGLE step, F1 maxes immediately.
+    #   * step_frac == 1.5 : UNSTABLE -- overshoot pierces faces, 1-11 pull-back
+    #       repairs EVERY step, never fully settles.
+    #   * step_frac == 2.0 : BROKEN -- 134 repairs, residual stuck ~0.215tau
+    #       (oscillates), F1 degrades below the start.
+    # So step_frac=1.0 (gd_lr=2.0 so the raw step can reach the cap) is the
+    # largest stable step and fits in ~1-3 base steps; drop to 0.8 for a
+    # one-step safety margin on shells the ROI crop under-represents.
+    n_steps: int = 40,
+    step_frac: float = 1.0,
+    gd_lr: float = 2.0,
     laplacian_weight: float = 30.0,
     n_bisect: int = 16,
     resolve_iters: int = 8,
     pullback_min_move_tau: float = 0.0,
     trajectory_seg_chunk: int = 200000,
-    # adaptive subdivision near convergence (the same split is applied to the
-    # rest reference in lock-step, so the trajectory-crossing test stays valid).
-    max_subdivisions: int = 4,
-    plateau_window: int = 2,
+    # SAG-DRIVEN adaptive subdivision. At step_frac=1.0 every vertex lands on the
+    # target in ~1 step, so the residual plateaus near zero almost immediately;
+    # the plateau then just gates "vertices settled -> look for sagging faces".
+    # A face is split ONLY when its interior tents off the target beyond its
+    # corners (sag>refine_sag_mult*tau and centroid out of tolerance) -- the sole
+    # split that lowers surface-to-surface error -- so the count grows minimally
+    # and stops automatically once nothing sags. Small window/patience let a
+    # round fire every ~2 steps; max_subdivisions is the level cap (each level
+    # quarters a sagging face), generous here so 40 steps can fully resolve.
+    max_subdivisions: int = 12,
+    plateau_window: int = 1,
     plateau_rel_tol: float = 5e-3,
     plateau_patience: int = 1,
-    converge_abs_tau: float = 0.02,
-    # refine faces whose fit/coverage error exceeds error_mult * tau, i.e. those
-    # failing the L/2048 (=1 tau) acceptance bar (capped to the worst
-    # max_refine_faces). 2.0 (the fit() default) is too strict here -- case1's
-    # residuals sit below 2 tau yet still fail the 1-tau F1 bar widely.
+    converge_abs_tau: float = 0.05,
+    # sag-based localizer thresholds. 2.0 (split only faces tented >2tau, where a
+    # diagnostic on case1 found ZERO after projection -> minimal/no subdivision,
+    # the fewest-faces optimum); >=1 would chase the target's ~tau discretization
+    # noise and blow up the face count without improving F1.
+    refine_sag_mult: float = 2.0,
+    refine_centroid_mult: float = 2.0,
+    refine_sag_quantile: float = 0.0,
+    # legacy vertex-error localizer knobs (unused while refine_sag_mult>0).
     error_mult: float = 1.0,
     error_quantile: float = 0.9,
     max_refine_faces: int = 1500000,
@@ -366,6 +394,9 @@ def demo_stepwise_clamped(
         error_mult=error_mult,
         error_quantile=error_quantile,
         max_refine_faces=max_refine_faces,
+        refine_sag_mult=refine_sag_mult,
+        refine_centroid_mult=refine_centroid_mult,
+        refine_sag_quantile=refine_sag_quantile,
         unopt_error_tau=unopt_error_tau,
         unopt_min_intended_move_tau=unopt_min_intended_move_tau,
         unopt_min_actual_move_tau=unopt_min_actual_move_tau,

@@ -25,6 +25,7 @@ from non_rigid_icp.Method.convergence import PlateauMonitor
 from non_rigid_icp.Method.error_field import (
     localizeHighErrorFaces,
     localizePlateauHighErrorFaces,
+    localizeSaggingFaces,
 )
 from non_rigid_icp.Method.subdivision import subdivideMarkedFaces
 from non_rigid_icp.Method.fit_state import (
@@ -45,7 +46,7 @@ from non_rigid_icp.Method.trajectory_guard import (
 from non_rigid_icp.Method.spatial_hash import triangleAABBs, estimateCellSize
 from non_rigid_icp.Method.implicit_field import ImplicitField
 from non_rigid_icp.Method.triton_kernels import clampNorm
-from non_rigid_icp.Method.crop import cropMeshByBBox
+from non_rigid_icp.Method.crop import cropMeshByBBox, cropMeshToBBoxUnion
 from non_rigid_icp.Method.sheet_constraints import (
     detectSheetPairs,
     detectWallPairsRaycast,
@@ -170,6 +171,24 @@ class WatertightFitter(object):
         max_refine_faces: Union[int, None] = 1500000,
         min_component_faces: int = 4,
         dilation_rings: int = 1,
+        # --- sag-based adaptive subdivision (the clamped stepwise path) ---
+        # refine ONLY faces whose interior tents off the target beyond their
+        # corners: sag(f)=d(centroid,T)-mean_i d(v_i,T) > refine_sag_mult*tau AND
+        # d(centroid,T) > refine_centroid_mult*tau. This is the sole criterion
+        # that lowers the surface-to-surface error for the fewest faces (see
+        # error_field.faceSagError); set refine_sag_mult<=0 to fall back to the
+        # legacy vertex-error localizer.
+        #
+        # The threshold MUST sit clearly above tau: a finite triangle on a curved
+        # target always has a residual ~tau sag, so splitting at sag>=1*tau just
+        # regenerates ~tau-sag children forever (chasing the target's own
+        # discretization noise) without improving F1. A diagnostic on case1 after
+        # one projection step found EVERY face within 1.8 tau (0 faces sag>2tau),
+        # so 2.0 only splits genuinely tented faces -- of which a well-projected
+        # mesh has essentially none, exactly the "fewest faces" optimum.
+        refine_sag_mult: float = 2.0,
+        refine_centroid_mult: float = 2.0,
+        refine_sag_quantile: float = 0.0,
         # --- unoptimizable-vertex state machine (clamped stepwise path) ---
         unopt_error_tau: float = 1.0,
         unopt_min_intended_move_tau: float = 0.02,
@@ -185,6 +204,16 @@ class WatertightFitter(object):
         eval_bbox_mode: str = "all",
         eval_bboxes: Union[list, tuple, None] = None,
         crop_eval_samples: int = 300000,
+        # OPTIONAL pre-fit crop (validation only, zero-cost to disable). When set,
+        # right after the rigid ICP and BEFORE any optimization the source AND
+        # target meshes are cropped in lock-step to the UNION of these boxes, so a
+        # huge mesh can be validated on just the regions of interest while every
+        # kept region is bit-for-bit what the full-mesh run would optimize. Boxes
+        # use the SAME original-target frame as `eval_bboxes`; pass None / [] (the
+        # default) to fully remove the crop. Each item: dict{center,edge[,mode]}
+        # or (center, edge[, mode]) tuple. `prefit_crop_mode` is the default mode.
+        prefit_crop_bboxes: Union[list, tuple, None] = None,
+        prefit_crop_mode: str = "centroid",
         save_result_folder_path: Union[str, None] = "auto",
         seed: int = 0,
     ) -> None:
@@ -254,6 +283,9 @@ class WatertightFitter(object):
         self.max_refine_faces = max_refine_faces
         self.min_component_faces = min_component_faces
         self.dilation_rings = dilation_rings
+        self.refine_sag_mult = refine_sag_mult
+        self.refine_centroid_mult = refine_centroid_mult
+        self.refine_sag_quantile = refine_sag_quantile
 
         self.unopt_error_tau = unopt_error_tau
         self.unopt_min_intended_move_tau = unopt_min_intended_move_tau
@@ -278,6 +310,11 @@ class WatertightFitter(object):
             eval_bboxes, eval_bbox_center, eval_bbox_edge, eval_bbox_mode
         )
         self.crop_eval_samples = crop_eval_samples
+        # optional pre-fit crop (see __init__ docstring). Reuse _normalizeBBoxes
+        # so a single dict / tuple / list is all accepted; [] disables it.
+        self.prefit_crop_bboxes = self._normalizeBBoxes(
+            prefit_crop_bboxes, None, eval_bbox_edge, prefit_crop_mode
+        )
 
         self.seed = seed
 
@@ -364,6 +401,48 @@ class WatertightFitter(object):
             return
         source_o3d.transform(transformation)
         self.source_mesh.vertices = np.asarray(source_o3d.vertices)
+        return
+
+    def _applyPrefitCrop(self) -> None:
+        """OPTIONAL, minimally-invasive: crop source+target to the union of
+        `prefit_crop_bboxes` right after the rigid ICP and before any
+        optimization, so a huge mesh can be validated on the regions of interest
+        only. No-op when `prefit_crop_bboxes` is empty (the production path).
+
+        Both meshes are already in the shared normalized frame here, while the
+        boxes are given in the original-target frame (same convention as
+        `eval_bboxes`); each box is therefore mapped to normalized coords via
+        c_norm=(c-center)*scale, edge_norm=edge*scale before cropping. Source
+        and target are cropped with the IDENTICAL boxes so the kept region is
+        exactly aligned across the two meshes."""
+        if not self.prefit_crop_bboxes:
+            return
+
+        def _toNorm(box):
+            c = (np.asarray(box["center"], dtype=np.float64) - self.norm_center) \
+                * self.norm_scale
+            e = np.asarray(box["edge"], dtype=np.float64) * self.norm_scale
+            return c, e
+
+        boxes = [_toNorm(b) for b in self.prefit_crop_bboxes]
+        # one mode for the whole pre-fit crop (boxes share prefit_crop_mode).
+        mode = self.prefit_crop_bboxes[0]["mode"]
+
+        for label, mesh in (("source", self.source_mesh), ("target", self.target_mesh)):
+            v0 = np.asarray(mesh.vertices)
+            f0 = np.asarray(mesh.triangles)
+            sv, sf = cropMeshToBBoxUnion(v0, f0, boxes, mode=mode)
+            mesh.vertices = sv
+            mesh.triangles = sf
+            mesh.vertex_colors = None
+            mesh.vertex_normals = None
+            mesh.triangle_normals = None
+            print(
+                f"[INFO][WatertightFitter::_applyPrefitCrop] {label}: "
+                f"{v0.shape[0]}->{sv.shape[0]} verts, "
+                f"{f0.shape[0]}->{sf.shape[0]} faces "
+                f"({len(boxes)} bbox union, mode={mode})"
+            )
         return
 
     # ------------------------------------------------------------------ #
@@ -1150,6 +1229,37 @@ class WatertightFitter(object):
         (see `localizePlateauHighErrorFaces`); otherwise the legacy global
         high-error localizer is used (the Adam `fit()` path)."""
         deformed = self._deformed().detach()
+        # PREFERRED (stepwise) path: refine only faces whose INTERIOR sags off
+        # the target while their corners are already on it -- the only faces
+        # worth splitting for "the whole surface on the target", measured with
+        # the exact closest-point field (centroid-accurate).
+        if (
+            use_local_plateau
+            and self.refine_sag_mult > 0.0
+            and getattr(self, "_field", None) is not None
+        ):
+            region_mask, _sag, stats = localizeSaggingFaces(
+                deformed,
+                self._faces,
+                self._field,
+                self._face_adj,
+                tau=self._tau_norm,
+                sag_mult=self.refine_sag_mult,
+                centroid_mult=self.refine_centroid_mult,
+                quantile=self.refine_sag_quantile,
+                min_component_faces=self.min_component_faces,
+                dilation_rings=self.dilation_rings,
+                max_faces=self.max_refine_faces,
+            )
+            print(
+                f"[INFO][WatertightFitter] refine(sag) level {level}: "
+                f"{stats['n_region']} faces "
+                f"(sagging={stats['n_sagging']}, "
+                f"sag_thr={stats['sag_threshold']:.6f}, "
+                f"sag_max={stats['sag_max']:.6f}, "
+                f"cent_dist_max={stats['centroid_dist_max']:.6f})."
+            )
+            return region_mask, stats
         if use_local_plateau and getattr(self, "_fit_state", None) is not None:
             region_mask, _face_error, stats = localizePlateauHighErrorFaces(
                 deformed,
@@ -1244,6 +1354,7 @@ class WatertightFitter(object):
         assert self.source_mesh is not None and self.target_mesh is not None
 
         self._rigidInit()
+        self._applyPrefitCrop()
         self._baseline_mesh = self.source_mesh.clone()
 
         dev = self.device
@@ -1827,6 +1938,8 @@ class WatertightFitter(object):
         tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
         tF = np.asarray(self.target_mesh.triangles)
         field = ImplicitField(tV, tF, device=dev)
+        # expose for the sag-based refine localizer (exact centroid distances).
+        self._field = field
 
         records = []
         level = 0  # subdivision rounds done so far

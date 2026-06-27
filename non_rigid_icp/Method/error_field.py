@@ -30,6 +30,129 @@ def faceErrorFromVertexError(
     return vertex_error[faces].mean(dim=1)
 
 
+def faceCentroids(vertices: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+    """Per-face centroid (mean of the three vertices). (F, 3)."""
+    return vertices[faces].mean(dim=1)
+
+
+def faceSagError(
+    vertex_dist: torch.Tensor,
+    centroid_dist: torch.Tensor,
+    faces: torch.Tensor,
+) -> torch.Tensor:
+    """The "sag" of every face = how far its INTERIOR sits off the target
+    surface beyond what its three corners already account for:
+
+        sag(f) = d(centroid(f), target) - mean_i d(v_i, target)
+
+    First principles: the goal is to put the WHOLE source surface on the target.
+    A vertex's distance is driven to ~0 by the per-step closest-point projection,
+    so a face with all three corners on the target but a far-off centroid is a
+    flat triangle *tented* across a target feature (ridge / valley / hole edge) --
+    its interior is the only part still off-surface. `sag` isolates exactly that
+    defect and is ~0 for a face that already lies flat on the target (corners and
+    centroid equidistant), so refining by `sag` is self-terminating: splitting a
+    tented face inserts midpoints that the next projection pulls onto the target,
+    shrinking the children's sag until they fall within tolerance. Refining any
+    OTHER face cannot lower the surface-to-surface error and only multiplies face
+    count -- hence `sag` gives "the fewest faces for the lowest error".
+
+    `vertex_dist` is (V,), `centroid_dist` is (F,). Returns (F,) (clamped >= 0).
+    """
+    mean_vert = vertex_dist[faces].mean(dim=1)
+    return (centroid_dist - mean_vert).clamp(min=0.0)
+
+
+def localizeSaggingFaces(
+    deformed_vertices: torch.Tensor,
+    faces: torch.Tensor,
+    field,
+    face_adjacency: torch.Tensor,
+    tau: float,
+    *,
+    sag_mult: float = 1.0,
+    centroid_mult: float = 1.0,
+    quantile: float = 0.0,
+    min_component_faces: int = 1,
+    dilation_rings: int = 0,
+    max_faces: Union[int, None] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Locate faces whose INTERIOR sags off the target while their corners are
+    already on it -- the only faces worth subdividing for the "whole surface on
+    target" goal (see `faceSagError`).
+
+    Uses the exact closest-point `field` (an `ImplicitField`) to measure the
+    true distance of both the vertices and the face centroids to the target
+    surface (face-interior accurate, unlike a sampled-point k-NN), then keeps a
+    face when BOTH:
+        sag(f)         > sag_mult      * tau   (interior tented beyond corners)
+        d(centroid, T) > centroid_mult * tau   (and the interior is itself out of
+                                                tolerance -- a face already within
+                                                tau everywhere needs no split).
+    `quantile` (optional) raises the sag bar to the worst (1-quantile) fraction;
+    `max_faces` caps the per-round budget to the highest-sag faces. All batched,
+    no Python loops over faces.
+
+    Returns (region_mask (F,) bool, sag (F,) float, stats dict).
+    """
+    device = deformed_vertices.device
+    # exact distance of every vertex and every face centroid to the target.
+    cp_v, _, _ = field.closestPoints(deformed_vertices)
+    vert_dist = (cp_v - deformed_vertices).norm(dim=1)              # (V,)
+    centroids = faceCentroids(deformed_vertices, faces)            # (F,3)
+    cp_c, _, _ = field.closestPoints(centroids)
+    cent_dist = (cp_c - centroids).norm(dim=1)                     # (F,)
+
+    sag = faceSagError(vert_dist, cent_dist, faces)               # (F,)
+
+    sag_thr = sag_mult * float(tau)
+    if quantile and quantile > 0.0:
+        if sag.numel() < 8_000_000:
+            sample = sag.float()
+        else:
+            perm = torch.randperm(sag.numel(), device=device)[:8_000_000]
+            sample = sag.float()[perm]
+        sag_thr = max(sag_thr, torch.quantile(sample, quantile).item())
+
+    raw_mask = (sag > sag_thr) & (cent_dist > centroid_mult * float(tau))
+
+    if max_faces is not None and int(raw_mask.sum().item()) > max_faces:
+        masked = torch.where(raw_mask, sag, torch.full_like(sag, -1.0))
+        topk = torch.topk(masked, max_faces).indices
+        capped = torch.zeros_like(raw_mask)
+        capped[topk] = True
+        raw_mask = capped
+
+    # optional clean of tiny components, then optional dilation for crack-free
+    # children. Defaults (min_component_faces=1, dilation_rings=0) keep ONLY the
+    # truly sagging faces so the face budget is minimal; the conforming
+    # subdivision already inserts a transition fan so no crack appears.
+    if min_component_faces > 1:
+        labels, sizes = connectedFaceComponents(raw_mask, face_adjacency)
+        if sizes.size > 0:
+            small = np.nonzero(sizes < min_component_faces)[0]
+            if small.size > 0:
+                cleaned_np = raw_mask.detach().cpu().numpy().copy()
+                cleaned_np[np.isin(labels, small)] = False
+                raw_mask = torch.from_numpy(cleaned_np).to(device)
+    region_mask = (
+        dilateFaceMask(raw_mask, face_adjacency, dilation_rings)
+        if dilation_rings > 0 else raw_mask
+    )
+
+    stats = {
+        "tau": float(tau),
+        "sag_threshold": float(sag_thr),
+        "sag_max": float(sag.max().item()) if sag.numel() else 0.0,
+        "sag_mean": float(sag.mean().item()) if sag.numel() else 0.0,
+        "centroid_dist_max": float(cent_dist.max().item()) if cent_dist.numel() else 0.0,
+        "vert_dist_mean": float(vert_dist.mean().item()) if vert_dist.numel() else 0.0,
+        "n_sagging": int(raw_mask.sum().item()),
+        "n_region": int(region_mask.sum().item()),
+    }
+    return region_mask, sag, stats
+
+
 def fitVertexError(
     deformed_vertices: torch.Tensor, target_index: NNIndex
 ) -> torch.Tensor:
