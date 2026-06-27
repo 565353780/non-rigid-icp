@@ -13,11 +13,14 @@ import torch
 import numpy as np
 from typing import Tuple, Union
 
+from typing import Optional
+
 from non_rigid_icp.Method.nn import NNIndex
 from non_rigid_icp.Method.topology import (
     dilateFaceMask,
     connectedFaceComponents,
 )
+from non_rigid_icp.Method.fit_state import faceStateFromVertexState
 
 
 def faceErrorFromVertexError(
@@ -149,5 +152,115 @@ def localizeHighErrorFaces(
         "face_error_max": float(face_error.max().item()),
         "face_error_mean": float(face_error.mean().item()),
         "n_components": int(sizes.size),
+    }
+    return region_mask, face_error, stats
+
+
+def localizePlateauHighErrorFaces(
+    deformed_vertices: torch.Tensor,
+    faces: torch.Tensor,
+    target_points: torch.Tensor,
+    target_index: NNIndex,
+    face_adjacency: torch.Tensor,
+    fit_state: dict,
+    level: int,
+    tau: float,
+    *,
+    error_mult: float = 2.0,
+    quantile: float = 0.9,
+    min_component_faces: int = 4,
+    dilation_rings: int = 1,
+    max_faces: Optional[int] = None,
+    local_drop_tau: float = 0.02,
+    max_blocked_vertex_ratio: float = 0.5,
+    refine_cooldown: int = 1,
+    device: str = "cuda",
+):
+    """Refine only faces that are (a) high error, (b) LOCALLY plateaued, and
+    (c) still optimizable -- the three-condition criterion.
+
+    This replaces the old "global plateau -> refine the current high-error
+    faces" rule, which subdivided whatever happened to have high error when the
+    GLOBAL residual flattened, including unreachable thin shells whose error
+    never falls. Here every condition is local and batched:
+
+      high_error    : combined bidirectional per-face error exceeds the tolerance
+                      (the same absolute+quantile test as `selectHighErrorFaces`).
+      plateau_face  : the face's residual-drop EMA has flattened (per-face, from
+                      `fit_state`), i.e. THIS region stopped improving.
+      not blocked   : fewer than `max_blocked_vertex_ratio` of the face's
+                      vertices are non-optimizable -- an unreachable shell is
+                      skipped so subdivision is never wasted multiplying faces
+                      that cannot be pulled onto the target.
+      cool-down     : the face was not just created/refined (`last_refine` more
+                      than `refine_cooldown` levels old) so a region is not
+                      re-split on consecutive rounds.
+
+    Returns (region_mask, face_error, stats).
+    """
+    fit_v = fitVertexError(deformed_vertices, target_index)
+    cov_v = coverageVertexError(deformed_vertices, target_points, device=device)
+    fit_f = faceErrorFromVertexError(fit_v, faces)
+    cov_f = faceErrorFromVertexError(cov_v, faces)
+    face_error = torch.maximum(fit_f, cov_f)
+
+    high_mask, thr = selectHighErrorFaces(
+        face_error, tau, error_mult, quantile, max_faces=None
+    )
+
+    fstate = faceStateFromVertexState(
+        fit_state,
+        faces,
+        tau,
+        local_drop_tau=local_drop_tau,
+        max_blocked_vertex_ratio=max_blocked_vertex_ratio,
+    )
+    cool = (level - fstate["last_refine"]) >= int(refine_cooldown)
+    candidate = high_mask & fstate["plateau_face"] & (~fstate["blocked_face"]) & cool
+
+    # cap AFTER the three-condition filter so the budget is spent on faces that
+    # are actually worth refining (highest error among the eligible ones).
+    if max_faces is not None and int(candidate.sum().item()) > max_faces:
+        masked_err = torch.where(
+            candidate, face_error, torch.full_like(face_error, -1.0)
+        )
+        topk = torch.topk(masked_err, max_faces).indices
+        capped = torch.zeros_like(candidate)
+        capped[topk] = True
+        candidate = capped
+
+    n_high = int(high_mask.sum().item())
+    n_plateau = int((high_mask & fstate["plateau_face"]).sum().item())
+    n_blocked_skipped = int(
+        (high_mask & fstate["plateau_face"] & fstate["blocked_face"]).sum().item()
+    )
+    n_candidate = int(candidate.sum().item())
+
+    # clean tiny noise components, then dilate one ring for a crack-free region
+    labels, sizes = connectedFaceComponents(candidate, face_adjacency)
+    if sizes.size > 0 and min_component_faces > 1:
+        small = np.nonzero(sizes < min_component_faces)[0]
+        if small.size > 0:
+            small_set = np.isin(labels, small)
+            cleaned_np = candidate.detach().cpu().numpy().copy()
+            cleaned_np[small_set] = False
+            cleaned = torch.from_numpy(cleaned_np).to(candidate.device)
+        else:
+            cleaned = candidate
+    else:
+        cleaned = candidate
+
+    region_mask = dilateFaceMask(cleaned, face_adjacency, dilation_rings)
+
+    stats = {
+        "threshold": float(thr),
+        "tau": float(tau),
+        "face_error_max": float(face_error.max().item()),
+        "face_error_mean": float(face_error.mean().item()),
+        "n_high_error_faces": n_high,
+        "n_local_plateau_faces": n_plateau,
+        "n_blocked_faces_skipped": n_blocked_skipped,
+        "n_candidate_faces": n_candidate,
+        "n_region": int(region_mask.sum().item()),
     }
     return region_mask, face_error, stats

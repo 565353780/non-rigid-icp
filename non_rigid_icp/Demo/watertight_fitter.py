@@ -298,9 +298,22 @@ def demo_stepwise_clamped(
     error_mult: float = 1.0,
     error_quantile: float = 0.9,
     max_refine_faces: int = 1500000,
-    # region-restricted (bbox) evaluation, in the de-normalized / original frame
-    eval_bbox_center=(-0.02, 0.23, 0.01),
-    eval_bbox_edge: float = 0.2,
+    # unoptimizable-vertex state machine (drop unreachable thin-shell vertices
+    # from the data loss + skip them in adaptive subdivision)
+    unopt_error_tau: float = 1.0,
+    unopt_min_intended_move_tau: float = 0.02,
+    unopt_min_actual_move_tau: float = 0.004,
+    unopt_min_progress_ratio: float = 0.1,
+    unopt_block_patience: int = 3,
+    local_drop_tau: float = 0.02,
+    max_blocked_vertex_ratio: float = 0.5,
+    refine_cooldown: int = 1,
+    # region-restricted (bbox) evaluation, in the de-normalized / original frame.
+    # Two regions of interest are tracked + saved independently (debug/<name>/).
+    eval_bboxes=(
+        {"name": "bbox_0", "center": (-0.02, 0.23, 0.01), "edge": 0.2},
+        {"name": "bbox_1", "center": (-0.01, -0.12, 0.08), "edge": 0.2},
+    ),
     eval_bbox_mode: str = "all",
     crop_eval_samples: int = 300000,
     crop_eval: bool = True,
@@ -353,8 +366,15 @@ def demo_stepwise_clamped(
         error_mult=error_mult,
         error_quantile=error_quantile,
         max_refine_faces=max_refine_faces,
-        eval_bbox_center=eval_bbox_center,
-        eval_bbox_edge=eval_bbox_edge,
+        unopt_error_tau=unopt_error_tau,
+        unopt_min_intended_move_tau=unopt_min_intended_move_tau,
+        unopt_min_actual_move_tau=unopt_min_actual_move_tau,
+        unopt_min_progress_ratio=unopt_min_progress_ratio,
+        unopt_block_patience=unopt_block_patience,
+        local_drop_tau=local_drop_tau,
+        max_blocked_vertex_ratio=max_blocked_vertex_ratio,
+        refine_cooldown=refine_cooldown,
+        eval_bboxes=eval_bboxes,
         eval_bbox_mode=eval_bbox_mode,
         crop_eval_samples=crop_eval_samples,
         save_result_folder_path=save_result_folder_path,

@@ -17,6 +17,18 @@ import open3d as o3d
 
 from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Method.crop import cropMeshByBBox, bboxFromCenterEdge
+from non_rigid_icp.Method.fit_state import (
+    initVertexFitState,
+    updateVertexFitState,
+    stateFloatAttrs,
+    stateFromFloatAttrs,
+)
+from non_rigid_icp.Method.geometry import segmentTriangleIntersect
+from non_rigid_icp.Method.triton_kernels import (
+    segmentTrianglePairHits,
+    clampNorm,
+    tritonAvailable,
+)
 from non_rigid_icp.Module.watertight_fitter import WatertightFitter
 
 
@@ -95,6 +107,80 @@ def test_lockstep_subdivision():
           f"ref.shape==verts.shape=={tuple(fitter._ref_verts.shape)}")
 
 
+def test_fit_state_machine():
+    print("=== test_fit_state_machine ===")
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    tau = 0.01
+    st = initVertexFitState(4, dev)
+    # vertex 0: wants to move, stays off-surface, never actually moves -> blocked
+    # vertex 1: wants to move and makes progress -> stays optimizable
+    # vertex 2: already on the surface (small residual) -> never counts as stalled
+    # vertex 3: never intends to move -> never stalled
+    resid = torch.tensor([5 * tau, 5 * tau, 0.1 * tau, 5 * tau], device=dev)
+    intended = torch.tensor([0.2 * tau, 0.2 * tau, 0.2 * tau, 0.0], device=dev)
+    actual_block = torch.tensor([0.0, 0.0, 0.0, 0.0], device=dev)
+    actual_prog = torch.tensor([0.2 * tau, 0.2 * tau, 0.0, 0.0], device=dev)
+    for _ in range(3):
+        updateVertexFitState(
+            st, resid,
+            intended,
+            torch.tensor([0.0, 0.2 * tau, 0.0, 0.0], device=dev),
+            tau, block_patience=3,
+        )
+    opt = st["optimizable"]
+    assert not bool(opt[0]), "stalled off-surface vertex should be dropped"
+    assert bool(opt[1]), "progressing vertex must stay optimizable"
+    assert bool(opt[2]), "on-surface vertex must stay optimizable"
+    assert bool(opt[3]), "non-moving vertex must stay optimizable"
+    print("  optimizable after 3 stalled steps:", opt.tolist())
+
+    # pack/unpack round trip keeps the (original) state and blends midpoints
+    attrs = stateFloatAttrs(st)
+    # append a midpoint blending vtx0 (blocked) and vtx1 (optimizable)
+    mid = 0.5 * (attrs[0] + attrs[1])
+    attrs2 = torch.cat([attrs, mid.unsqueeze(0)], dim=0)
+    st2 = stateFromFloatAttrs(attrs2, n_orig=4, device=dev)
+    assert st2["optimizable"][:4].tolist() == opt.tolist(), "originals must survive"
+    assert bool(st2["optimizable"][4]), "midpoint optimizable if either parent is"
+    print("  pack/unpack ok; midpoint optimizable =", bool(st2["optimizable"][4]))
+
+
+def test_triton_parity():
+    print("=== test_triton_parity ===")
+    if not torch.cuda.is_available():
+        print("  (no CUDA, skipping)")
+        return
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+    s, t = 500, 400
+    ss = torch.rand(s, 3, device=dev, generator=g)
+    se = ss + 0.3 * (torch.rand(s, 3, device=dev, generator=g) - 0.5)
+    va = torch.rand(t, 3, device=dev, generator=g)
+    vb = torch.rand(t, 3, device=dev, generator=g)
+    vc = torch.rand(t, 3, device=dev, generator=g)
+    p = 8000
+    seg_id = torch.randint(0, s, (p,), device=dev, generator=g)
+    tri_id = torch.randint(0, t, (p,), device=dev, generator=g)
+
+    hit_k = segmentTrianglePairHits(seg_id, tri_id, ss, se, va, vb, vc)
+    hit_ref = segmentTriangleIntersect(
+        ss[seg_id], se[seg_id], va[tri_id], vb[tri_id], vc[tri_id]
+    )
+    n_diff = int((hit_k != hit_ref).sum().item())
+    print(f"  triton_available={tritonAvailable()}, hits={int(hit_ref.sum())}, "
+          f"mismatches={n_diff}")
+    assert n_diff == 0, "triton seg-tri kernel disagrees with torch"
+
+    vecs = torch.randn(2000, 3, device=dev, generator=g)
+    cap = torch.rand(2000, device=dev, generator=g)
+    out_k = clampNorm(vecs, cap)
+    norm = vecs.norm(dim=-1, keepdim=True)
+    scale = torch.clamp(cap.reshape(-1, 1) / (norm + 1e-20), max=1.0)
+    out_ref = vecs * scale
+    assert torch.allclose(out_k, out_ref, atol=1e-5), "clampNorm kernel mismatch"
+    print("  clampNorm parity ok")
+
+
 def test_stepwise_clamped_with_subdivision():
     print("=== test_stepwise_clamped_with_subdivision ===")
     out_dir = "./output/_test_stepwise_clamped/"
@@ -113,16 +199,24 @@ def test_stepwise_clamped_with_subdivision():
         plateau_window=1,
         plateau_rel_tol=0.5,
         plateau_patience=1,
-        eval_bbox_center=(0.0, 0.0, 0.0),
-        eval_bbox_edge=0.5,
+        # exercise the local-plateau subdivision: a region must stop improving
+        # (drop EMA below local_drop_tau) AND still be optimizable before it is
+        # refined. A loose local_drop_tau + enough steps for the geometric decay
+        # to flatten makes the synthetic sphere reach that state.
+        local_drop_tau=0.2,
+        eval_bboxes=(
+            {"name": "bbox_0", "center": (0.0, 0.0, 0.0), "edge": 0.5},
+            {"name": "bbox_1", "center": (0.1, 0.0, 0.0), "edge": 0.5},
+        ),
         crop_eval_samples=20000,
         save_result_folder_path=out_dir,
     )
     fitter.loadMeshes(src, tgt)
     out = fitter.fitStepwiseClamped(
-        n_steps=6,
+        n_steps=24,
         step_frac=0.2,
         max_subdivisions=2,
+        converge_abs_tau=None,
         save_folder=out_dir,
         crop_eval=True,
         full_chamfer_each_step=False,
@@ -133,20 +227,31 @@ def test_stepwise_clamped_with_subdivision():
     print("  residual_tau per step:", [round(x, 2) for x in res])
     assert res[-1] < res[0], "residual did not decrease"
     assert out["subdivision_rounds"] >= 1, "no subdivision triggered"
-    # crop debug files exist
+    # crop debug files exist for BOTH boxes under their own subfolder
     dbg = os.path.join(out_dir, "debug")
-    assert os.path.exists(os.path.join(dbg, "target_crop.ply")), "no target crop saved"
-    assert os.path.exists(os.path.join(dbg, "step_00_crop.ply")), "no source crop saved"
-    # crop metrics present
+    for name in ("bbox_0", "bbox_1"):
+        assert os.path.exists(os.path.join(dbg, name, "target_crop.ply")), \
+            f"no target crop saved for {name}"
+        assert os.path.exists(os.path.join(dbg, name, "step_00_crop.ply")), \
+            f"no source crop saved for {name}"
+    # per-box crop metrics present + unprefixed alias for the first box
+    assert out["steps"][0].get("bbox_0_crop_chamfer_l1") is not None
+    assert out["steps"][0].get("bbox_1_crop_chamfer_l1") is not None
     assert out["steps"][0].get("crop_chamfer_l1") is not None
+    # the state-machine metrics are recorded each step
+    assert "n_unoptimizable_vertices" in out["steps"][0]
+    assert len(out["eval_bboxes"]) == 2
     print(f"  stepwise ok: subdivisions={out['subdivision_rounds']}, "
-          f"crop_cd[0]={out['steps'][0]['crop_chamfer_l1']:.5f} -> "
-          f"crop_cd[-1]={out['steps'][-1]['crop_chamfer_l1']:.5f}, "
+          f"bbox_0_cd[0]={out['steps'][0]['bbox_0_crop_chamfer_l1']:.5f} -> "
+          f"bbox_0_cd[-1]={out['steps'][-1]['bbox_0_crop_chamfer_l1']:.5f}, "
+          f"unopt[-1]={out['steps'][-1]['n_unoptimizable_vertices']}, "
           f"final_full_cd={out.get('final_chamfer_l1'):.5f}")
 
 
 if __name__ == "__main__":
     test_crop_atom()
+    test_fit_state_machine()
+    test_triton_parity()
     test_lockstep_subdivision()
     test_stepwise_clamped_with_subdivision()
     print("\nALL TESTS PASSED")

@@ -21,7 +21,7 @@ fixed candidate set, because shrinking the step only shrinks each segment's AABB
 import torch
 from typing import Tuple, Union
 
-from non_rigid_icp.Method.geometry import segmentTriangleIntersect
+from non_rigid_icp.Method.triton_kernels import segmentTrianglePairHits
 from non_rigid_icp.Method.spatial_hash import (
     triangleAABBs,
     estimateCellSize,
@@ -150,16 +150,18 @@ def _narrow_seg_hits(
     """Per-segment bool: does any candidate triangle pierce this segment?"""
     out = torch.zeros(n_seg, dtype=torch.bool, device=faces.device)
     p = cand_seg.shape[0]
+    if p == 0:
+        return out
+    # gather the 3 triangle-vertex arrays ONCE (the Triton pair kernel indexes
+    # them by global face id, fusing the per-pair gather + Moller-Trumbore math).
+    va = vertices[faces[:, 0]]
+    vb = vertices[faces[:, 1]]
+    vc = vertices[faces[:, 2]]
     for start in range(0, p, narrow_chunk):
         cs = cand_seg[start : start + narrow_chunk]
         ct = cand_tri[start : start + narrow_chunk]
-        tri = faces[ct]
-        hit = segmentTriangleIntersect(
-            seg_start[cs],
-            seg_end[cs],
-            vertices[tri[:, 0]],
-            vertices[tri[:, 1]],
-            vertices[tri[:, 2]],
+        hit = segmentTrianglePairHits(
+            cs, ct, seg_start, seg_end, va, vb, vc
         )
         if bool(hit.any()):
             out[cs[hit]] = True
@@ -184,19 +186,16 @@ def _narrow_seg_pairs(
     if p == 0:
         return torch.zeros(0, dtype=torch.bool, device=faces.device)
     out = torch.zeros(p, dtype=torch.bool, device=faces.device)
+    va = vertices[faces[:, 0]]
+    vb = vertices[faces[:, 1]]
+    vc = vertices[faces[:, 2]]
     for start in range(0, p, narrow_chunk):
         sl = slice(start, start + narrow_chunk)
         cs = cand_seg[sl]
         ct = cand_tri[sl]
-        tri = faces[ct]
-        hit = segmentTriangleIntersect(
-            seg_start[cs],
-            seg_end[cs],
-            vertices[tri[:, 0]],
-            vertices[tri[:, 1]],
-            vertices[tri[:, 2]],
+        out[sl] = segmentTrianglePairHits(
+            cs, ct, seg_start, seg_end, va, vb, vc
         )
-        out[sl] = hit
     return out
 
 
