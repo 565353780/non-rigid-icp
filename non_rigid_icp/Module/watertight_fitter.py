@@ -2286,6 +2286,79 @@ class WatertightFitter(object):
             / self._tau_norm,
         }
 
+    def _frontAdvancingLockedProjectStep(
+        self,
+        field: "ImplicitField",
+        backoff: float = 0.8,
+        relax_iters: int = 60,
+    ) -> dict:
+        """ONE penetration-free projection that moves ONLY the unlocked vertices.
+
+        Lock-and-refine schedule (the user's monotonic-error idea): vertices fitted
+        in a previous step are FROZEN (`self._locked`), so each step only advances
+        the vertices inserted by the last subdivision. Concretely:
+
+          * locked vertices keep their current position (target = current, so their
+            segment is zero -- they never move);
+          * unlocked vertices target their exact closest point cp on the target;
+          * the penetration relaxation runs with the same `locked_mask`, so only
+            unlocked vertices are ever backed off.
+
+        Because a frozen vertex is already on the target and a new midpoint sits
+        between two such vertices, projecting it can only shrink its distance and
+        cannot disturb the already-fitted surface -- hence the global fit error is
+        monotonically non-increasing across steps. Returns per-step stats plus the
+        `moved_mask` of unlocked vertices that actually advanced (for the caller to
+        freeze afterwards).
+        """
+        dev = self.device
+        with torch.no_grad():
+            cur = self._deformed().detach()
+            ref = self._ref_verts.detach()
+            locked = self._locked
+            cp, _, _ = field.closestPoints(cur)
+            # locked vertices do not move: their target is their current position.
+            target = torch.where(locked.unsqueeze(1), cur, cp)
+            d_unlocked = (cp - cur).norm(dim=1)
+            d_unlocked = d_unlocked[~locked] if bool((~locked).any()) else d_unlocked
+            cell = self._trajCellSize(cur)
+
+            new_pos, info = penetrationRelaxStep(
+                ref, cur, target, self._faces,
+                face_adjacency=self._face_adj,
+                cell_size=cell,
+                backoff=backoff,
+                max_iters=relax_iters,
+                locked_mask=locked,
+            )
+            self._disp.data.copy_(new_pos - self._verts)
+            moved = (new_pos - cur).norm(dim=1) > 1e-9
+            moved_mask = moved & (~locked)
+            # residual measured over the vertices this step was responsible for
+            resid_after_unlocked = (cp - new_pos).norm(dim=1)
+            if bool((~locked).any()):
+                resid_after_unlocked = resid_after_unlocked[~locked]
+        return {
+            "n_vertices": int(cur.shape[0]),
+            "n_locked_before": int(locked.sum().item()),
+            "n_unlocked_before": int((~locked).sum().item()),
+            "n_moved": int(moved_mask.sum().item()),
+            "relax_iters": info["iters"],
+            "pen_pairs_start": info["pen_pairs_start"],
+            "pen_pairs_end": info["pen_pairs_end"],
+            "backed_off_vertices": info["backed_off_vertices"],
+            "mean_alpha": info["mean_alpha"],
+            "fit_residual_before_tau": (
+                float(d_unlocked.mean().item()) / self._tau_norm
+                if d_unlocked.numel() else 0.0
+            ),
+            "fit_residual_after_tau": (
+                float(resid_after_unlocked.mean().item()) / self._tau_norm
+                if resid_after_unlocked.numel() else 0.0
+            ),
+            "_moved_mask": moved_mask,
+        }
+
     def fitFrontAdvancingSingleStep(
         self,
         backoff: float = 0.5,
@@ -2373,6 +2446,389 @@ class WatertightFitter(object):
         print("[INFO][pen-relax-step] log saved to",
               os.path.join(save_folder, "front_advance_log.json"))
         return rec
+
+    def fitFrontAdvancingRefineSteps(
+        self,
+        n_steps: int = 4,
+        backoff: float = 0.8,
+        relax_iters: int = 60,
+        refine_mean_mult: float = 1.0,
+        max_subdivisions: Union[int, None] = None,
+        save_folder: Union[str, None] = None,
+        crop_eval: bool = True,
+        compute_chamfer: bool = False,
+    ) -> dict:
+        """N steps of penetration-relaxed projection + above-mean local refine.
+
+        Each step (first principles, all reusing existing atoms):
+          1. project every vertex to its exact target closest point and relax out
+             the EXACT through-penetrations (`_frontAdvancingProjectStep` ->
+             `penetrationRelaxStep`), so the step adds zero new self-intersections;
+          2. save the full deformed mesh and the per-bbox crops, and record the
+             region-restricted Chamfer/F1 + fit error + (penetration-precise)
+             self-intersection counts;
+          3. unless this is the last step (or the subdivision budget is spent),
+             subdivide every face whose centroid is farther from the target than
+             the GLOBAL MEAN centroid distance (`localizeAboveMeanCentroidFaces`
+             via `_refine(level, use_local_plateau=True)`). The SAME edge-midpoint
+             split is applied to the clean source reference `_ref_verts` in
+             lock-step (`_applySubdivision` carries it as an extra vertex attr), so
+             the per-vertex correspondence ref[i]<->current[i] -- hence the segment
+             used for the trajectory / penetration tests -- is preserved for free.
+
+        Before the first step the INITIAL source is also evaluated + saved per
+        bbox, so the initial vs per-step error is directly comparable.
+
+        Returns a dict with `initial`, `steps` (one record each) and `refine_log`.
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = (
+                self.save_result_folder_path
+                or "./output/case1_front_advance_refine_4step/"
+            )
+        os.makedirs(save_folder, exist_ok=True)
+        debug_folder = os.path.join(save_folder, "debug")
+        os.makedirs(debug_folder, exist_ok=True)
+
+        if max_subdivisions is None:
+            max_subdivisions = self.max_subdivisions
+        # route `_refine` through the above-mean centroid-distance criterion.
+        self.refine_above_mean = True
+        self.refine_mean_mult = refine_mean_mult
+
+        tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
+        tF = np.asarray(self.target_mesh.triangles)
+        field = ImplicitField(tV, tF, device=dev)
+        self._field = field
+
+        t_start = time.time()
+
+        # ---- initial source: evaluate + save the un-deformed crop per bbox ----
+        initial_mesh = self._currentMeshNormalized()
+        initial_rec = {
+            "n_vertices": int(self._verts.shape[0]),
+            "n_faces": int(self._faces.shape[0]),
+        }
+        if crop_eval:
+            initial_rec.update(
+                self._evaluateMeshCropped(
+                    initial_mesh, debug_folder, "initial_source"
+                )
+            )
+        if compute_chamfer:
+            cm = self._currentChamfer(initial_mesh)
+            initial_rec["chamfer_l1"] = cm["chamfer_l1"]
+            initial_rec["f1"] = cm.get("f1")
+        init_str = ""
+        for box in self.eval_bboxes:
+            f1v = initial_rec.get(f"{box['name']}_crop_f1")
+            if f1v is not None:
+                init_str += f"{box['name']}_f1={f1v:.4f}, "
+        print(f"[INFO][pen-relax-4step] initial source: "
+              f"V={initial_rec['n_vertices']}, " + init_str)
+
+        step_records = []
+        level = 0
+        for step in range(n_steps):
+            t0 = time.time()
+            step_info = self._frontAdvancingProjectStep(
+                field, backoff=backoff, relax_iters=relax_iters,
+            )
+            t_step = time.time()
+
+            rec = {
+                "step": step,
+                "level": level,
+                "backoff": backoff,
+                "tau": self._tau_norm / self.norm_scale,
+                **step_info,
+            }
+
+            cur_mesh = self._currentMeshNormalized()
+            if crop_eval:
+                rec.update(
+                    self._evaluateMeshCropped(
+                        cur_mesh, debug_folder, f"step_{step:02d}"
+                    )
+                )
+            if compute_chamfer:
+                cm = self._currentChamfer(cur_mesh)
+                rec["chamfer_l1"] = cm["chamfer_l1"]
+                rec["f1"] = cm.get("f1")
+
+            with torch.no_grad():
+                tri = self._measureTriangleSelfIntersections()
+                traj = self._measureTrajectoryFull()
+            rec.update(tri)
+            rec["trajectory_crossing_vertices"] = (
+                traj["trajectory_crossing_vertices"]
+            )
+            rec["trajectory_crossing_pairs"] = traj["trajectory_crossing_pairs"]
+
+            rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            rec["t_step_s"] = round(t_step - t0, 1)
+
+            # ---- above-mean centroid-distance refinement (synced ref) ----
+            refined = False
+            if step < n_steps - 1 and level < max_subdivisions:
+                v_before = int(self._verts.shape[0])
+                f_before = int(self._faces.shape[0])
+                refined = self._refine(level, use_local_plateau=True)
+                if refined:
+                    level += 1
+                rec["refined"] = bool(refined)
+                rec["level_after"] = level
+                rec["vertices_after_refine"] = int(self._verts.shape[0])
+                rec["faces_after_refine"] = int(self._faces.shape[0])
+                if refined:
+                    print(
+                        f"[INFO][pen-relax-4step] step {step} refine: "
+                        f"V {v_before}->{self._verts.shape[0]}, "
+                        f"F {f_before}->{self._faces.shape[0]}."
+                    )
+
+            rec["seconds"] = round(time.time() - t0, 1)
+            step_records.append(rec)
+
+            crop_str = ""
+            for box in self.eval_bboxes:
+                f1v = rec.get(f"{box['name']}_crop_f1")
+                if f1v is not None:
+                    crop_str += f"{box['name']}_f1={f1v:.4f}, "
+            print(
+                f"[INFO][pen-relax-4step] step {step} (lvl {level}, "
+                f"V={rec['n_vertices']}): "
+                f"resid={rec['fit_residual_before_tau']:.3f}->"
+                f"{rec['fit_residual_after_tau']:.3f}tau, "
+                f"pen_pairs {rec['pen_pairs_start']}->{rec['pen_pairs_end']}, "
+                f"tri_si_new={rec['tri_intersecting_pairs_new']}, "
+                + crop_str
+                + f"{rec['seconds']}s"
+            )
+
+        out = {
+            "method": "front_advancing_refine_steps",
+            "n_steps": n_steps,
+            "backoff": backoff,
+            "relax_iters": relax_iters,
+            "refine_mean_mult": refine_mean_mult,
+            "max_subdivisions": max_subdivisions,
+            "tau": self._tau_norm / self.norm_scale,
+            "initial": initial_rec,
+            "steps": step_records,
+            "refine_log": self._refine_log,
+            "seconds": round(time.time() - t_start, 1),
+        }
+        with open(
+            os.path.join(save_folder, "front_advance_refine_4step_log.json"), "w"
+        ) as f:
+            json.dump(out, f, indent=2)
+        print("[INFO][pen-relax-4step] log saved to",
+              os.path.join(save_folder, "front_advance_refine_4step_log.json"))
+        return out
+
+    def fitFrontAdvancingLockedRefineSteps(
+        self,
+        n_steps: int = 4,
+        backoff: float = 0.8,
+        relax_iters: int = 60,
+        refine_mean_mult: float = 1.0,
+        max_subdivisions: Union[int, None] = None,
+        save_folder: Union[str, None] = None,
+        crop_eval: bool = True,
+        compute_chamfer: bool = False,
+    ) -> dict:
+        """Lock-and-refine: each step freezes the vertices it fits, then only the
+        newly subdivided vertices are optimized next step (monotonic error).
+
+        First principles (the user's idea): once a vertex sits on the target there
+        is nothing to gain by moving it again, and moving it risks disturbing an
+        already-good fit. So after every step the vertices that were optimized are
+        LOCKED; the subsequent above-mean subdivision inserts new midpoint vertices
+        (between locked, on-target vertices) which are the ONLY vertices the next
+        step moves. Because each new vertex starts at an edge midpoint of two
+        on-target vertices and is then projected onto the target, its distance can
+        only shrink, and the locked surface is untouched -- so the global fit error
+        is non-increasing across steps, by construction.
+
+        Mechanics, all reusing existing atoms:
+          * `_frontAdvancingLockedProjectStep` moves only the unlocked vertices to
+            their closest point and relaxes out exact penetrations (locked verts
+            frozen), so the step still adds zero new self-intersections;
+          * the vertices that moved are then frozen (`self._locked |= moved`);
+          * `_refine(level, use_local_plateau=True)` subdivides the above-mean
+            centroid-distance faces, carrying `_ref_verts` in lock-step; the new
+            vertices (indices >= v_before) are appended and marked UNLOCKED, every
+            pre-existing vertex keeps its lock state.
+
+        Returns a dict with `initial`, `steps`, and `refine_log`.
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = (
+                self.save_result_folder_path
+                or "./output/case1_front_advance_locked/"
+            )
+        os.makedirs(save_folder, exist_ok=True)
+        debug_folder = os.path.join(save_folder, "debug")
+        os.makedirs(debug_folder, exist_ok=True)
+
+        if max_subdivisions is None:
+            max_subdivisions = self.max_subdivisions
+        self.refine_above_mean = True
+        self.refine_mean_mult = refine_mean_mult
+
+        tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
+        tF = np.asarray(self.target_mesh.triangles)
+        field = ImplicitField(tV, tF, device=dev)
+        self._field = field
+
+        # persistent lock mask: nothing is fitted yet, so all vertices are movable.
+        self._locked = torch.zeros(
+            self._verts.shape[0], dtype=torch.bool, device=dev
+        )
+
+        t_start = time.time()
+
+        initial_mesh = self._currentMeshNormalized()
+        initial_rec = {
+            "n_vertices": int(self._verts.shape[0]),
+            "n_faces": int(self._faces.shape[0]),
+        }
+        if crop_eval:
+            initial_rec.update(
+                self._evaluateMeshCropped(
+                    initial_mesh, debug_folder, "initial_source"
+                )
+            )
+        if compute_chamfer:
+            cm = self._currentChamfer(initial_mesh)
+            initial_rec["chamfer_l1"] = cm["chamfer_l1"]
+            initial_rec["f1"] = cm.get("f1")
+        init_str = ""
+        for box in self.eval_bboxes:
+            f1v = initial_rec.get(f"{box['name']}_crop_f1")
+            if f1v is not None:
+                init_str += f"{box['name']}_f1={f1v:.4f}, "
+        print(f"[INFO][pen-relax-locked] initial source: "
+              f"V={initial_rec['n_vertices']}, " + init_str)
+
+        step_records = []
+        level = 0
+        for step in range(n_steps):
+            t0 = time.time()
+            step_info = self._frontAdvancingLockedProjectStep(
+                field, backoff=backoff, relax_iters=relax_iters,
+            )
+            moved_mask = step_info.pop("_moved_mask")
+            # freeze every vertex optimized this step
+            self._locked = self._locked | moved_mask
+            t_step = time.time()
+
+            rec = {
+                "step": step,
+                "level": level,
+                "backoff": backoff,
+                "tau": self._tau_norm / self.norm_scale,
+                "n_locked_after": int(self._locked.sum().item()),
+                **step_info,
+            }
+
+            cur_mesh = self._currentMeshNormalized()
+            if crop_eval:
+                rec.update(
+                    self._evaluateMeshCropped(
+                        cur_mesh, debug_folder, f"step_{step:02d}"
+                    )
+                )
+            if compute_chamfer:
+                cm = self._currentChamfer(cur_mesh)
+                rec["chamfer_l1"] = cm["chamfer_l1"]
+                rec["f1"] = cm.get("f1")
+
+            with torch.no_grad():
+                tri = self._measureTriangleSelfIntersections()
+                traj = self._measureTrajectoryFull()
+            rec.update(tri)
+            rec["trajectory_crossing_vertices"] = (
+                traj["trajectory_crossing_vertices"]
+            )
+            rec["trajectory_crossing_pairs"] = traj["trajectory_crossing_pairs"]
+
+            rec["mesh_path"] = self._saveStepMesh(save_folder, step)
+            rec["t_step_s"] = round(t_step - t0, 1)
+
+            # ---- above-mean refinement; new midpoints start UNLOCKED ----
+            refined = False
+            if step < n_steps - 1 and level < max_subdivisions:
+                v_before = int(self._verts.shape[0])
+                f_before = int(self._faces.shape[0])
+                refined = self._refine(level, use_local_plateau=True)
+                if refined:
+                    level += 1
+                    # original [0:v_before] keep their lock; new midpoints (>=
+                    # v_before) are unlocked so the NEXT step optimizes them only.
+                    new_locked = torch.zeros(
+                        self._verts.shape[0], dtype=torch.bool, device=dev
+                    )
+                    new_locked[:v_before] = self._locked[:v_before]
+                    self._locked = new_locked
+                rec["refined"] = bool(refined)
+                rec["level_after"] = level
+                rec["vertices_after_refine"] = int(self._verts.shape[0])
+                rec["faces_after_refine"] = int(self._faces.shape[0])
+                rec["n_new_vertices"] = int(self._verts.shape[0] - v_before)
+                if refined:
+                    print(
+                        f"[INFO][pen-relax-locked] step {step} refine: "
+                        f"V {v_before}->{self._verts.shape[0]}, "
+                        f"F {f_before}->{self._faces.shape[0]}, "
+                        f"new(unlocked)={self._verts.shape[0] - v_before}."
+                    )
+
+            rec["seconds"] = round(time.time() - t0, 1)
+            step_records.append(rec)
+
+            crop_str = ""
+            for box in self.eval_bboxes:
+                f1v = rec.get(f"{box['name']}_crop_f1")
+                if f1v is not None:
+                    crop_str += f"{box['name']}_f1={f1v:.4f}, "
+            print(
+                f"[INFO][pen-relax-locked] step {step} (lvl {level}, "
+                f"V={rec['n_vertices']}, locked={rec['n_locked_after']}): "
+                f"unlocked_resid={rec['fit_residual_before_tau']:.3f}->"
+                f"{rec['fit_residual_after_tau']:.3f}tau, "
+                f"moved={rec['n_moved']}, "
+                f"pen {rec['pen_pairs_start']}->{rec['pen_pairs_end']}, "
+                f"tri_si_new={rec['tri_intersecting_pairs_new']}, "
+                + crop_str
+                + f"{rec['seconds']}s"
+            )
+
+        out = {
+            "method": "front_advancing_locked_refine_steps",
+            "n_steps": n_steps,
+            "backoff": backoff,
+            "relax_iters": relax_iters,
+            "refine_mean_mult": refine_mean_mult,
+            "max_subdivisions": max_subdivisions,
+            "tau": self._tau_norm / self.norm_scale,
+            "initial": initial_rec,
+            "steps": step_records,
+            "refine_log": self._refine_log,
+            "seconds": round(time.time() - t_start, 1),
+        }
+        with open(
+            os.path.join(save_folder, "front_advance_locked_log.json"), "w"
+        ) as f:
+            json.dump(out, f, indent=2)
+        print("[INFO][pen-relax-locked] log saved to",
+              os.path.join(save_folder, "front_advance_locked_log.json"))
+        return out
 
     def fitStepwiseClamped(
         self,

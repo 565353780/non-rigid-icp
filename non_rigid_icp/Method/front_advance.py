@@ -297,6 +297,7 @@ def penetrationRelaxStep(
     max_iters: int = 60,
     exclude_ring: int = 1,
     ignore_baseline: bool = True,
+    locked_mask: Union[torch.Tensor, None] = None,
     progress: Union[Callable[[dict], None], None] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Drive every vertex to ``target`` then relax out TRUE penetrations.
@@ -327,6 +328,13 @@ def penetrationRelaxStep(
             vertices (0.5 halves the remaining advance each time).
         min_alpha_step: once a vertex's alpha drops below this it is pinned to 0
             (treated as un-movable this step) to guarantee termination.
+        locked_mask: optional (V,) bool. Locked vertices are FROZEN -- they are
+            never backed off (their fit from a previous step is preserved) and
+            their ``target`` is assumed already equal to their position (so
+            ``seg = 0`` and they do not move). Used by the lock-and-refine schedule
+            where each step only moves the newly inserted vertices. Because a new
+            penetration always involves at least one unlocked vertex, restricting
+            the back-off to unlocked vertices still resolves every new crossing.
 
     Returns:
         new_cur: (V,3) penetration-free positions.
@@ -338,18 +346,35 @@ def penetrationRelaxStep(
     dev = faces.device
     v = cur.shape[0]
     f = faces.shape[0]
-    seg = target - ref  # full per-vertex displacement ref->target
+    movable = (
+        torch.ones(v, dtype=torch.bool, device=dev)
+        if locked_mask is None else ~locked_mask
+    )
+    # back-off anchor (alpha = 0):
+    #   * unlocked schedule: the rest watertight mesh `ref` (penetration-free);
+    #   * locked schedule: the INCOMING pose `cur`. Retreating an unlocked vertex
+    #     to `cur` returns the mesh to the validated penetration-free baseline,
+    #     so pinning offenders to alpha = 0 provably clears every NEW penetration
+    #     without ever moving (or relying on) the frozen locked vertices.
+    anchor = cur if locked_mask is not None else ref
+    seg = target - anchor  # per-vertex displacement anchor->target
     alpha = torch.ones(v, device=dev)
-    work = ref + seg  # alpha = 1 everywhere
+    work = anchor + seg  # alpha = 1 everywhere (= target)
 
-    # baseline: penetrations ALREADY present on the watertight rest mesh. These
-    # are input artifacts the step neither caused nor can fix by backing toward
-    # rest, so they are excluded from the "to repair" set (matching the fitter's
-    # `tri_intersecting_pairs_new` diagnostic). We target only NEW penetrations.
+    # baseline: penetrations the step neither caused nor can fix, so they are
+    # excluded from the "to repair" set (matching `tri_intersecting_pairs_new`).
+    #   * unlocked schedule: the rest watertight mesh `ref` (input artifacts);
+    #   * locked schedule: the INCOMING pose `cur` itself -- locked vertices are
+    #     frozen at their already-fitted positions, so any pair already present
+    #     before this step moves the unlocked vertices is pre-existing and (if it
+    #     involves only locked vertices) unfixable. Baselining against `cur`
+    #     guarantees every remaining "new" pair involves at least one unlocked
+    #     vertex, which the back-off can always resolve.
     baseline_keys = None
     if ignore_baseline:
+        base_pose = cur if locked_mask is not None else ref
         base_inter = findSelfIntersections(
-            ref, faces, inflate=0.0, exclude_ring=exclude_ring,
+            base_pose, faces, inflate=0.0, exclude_ring=exclude_ring,
             face_adjacency=face_adjacency, cell_size=cell_size,
             predicate="penetrate",
         )
@@ -378,16 +403,19 @@ def penetrationRelaxStep(
             progress({"iter": it, "pen_pairs": n_pairs})
         if n_pairs == 0:
             break
-        # vertices incident to any penetrating face -> back their alpha off
+        # vertices incident to any penetrating face -> back their alpha off, but
+        # only the UNLOCKED ones (locked verts are frozen; a new penetration is
+        # guaranteed to involve at least one unlocked vertex).
         bad_faces = torch.unique(inter.reshape(-1))
         bad_vids = torch.unique(faces[bad_faces].reshape(-1))
+        bad_vids = bad_vids[movable[bad_vids]]
         new_alpha = alpha.clone()
         new_alpha[bad_vids] = alpha[bad_vids] * backoff
         # pin tiny alphas to exactly 0 (un-movable) for guaranteed termination
         new_alpha[new_alpha < min_alpha_step] = 0.0
         alpha = new_alpha
         backed[bad_vids] = True
-        work = ref + alpha.unsqueeze(1) * seg
+        work = anchor + alpha.unsqueeze(1) * seg
         last_pairs = n_pairs
 
     # Finishing pass: any pair still penetrating after the relaxation budget is a
@@ -408,9 +436,10 @@ def penetrationRelaxStep(
             break
         bad_faces = torch.unique(inter.reshape(-1))
         bad_vids = torch.unique(faces[bad_faces].reshape(-1))
+        bad_vids = bad_vids[movable[bad_vids]]
         alpha[bad_vids] = 0.0
         backed[bad_vids] = True
-        work = ref + alpha.unsqueeze(1) * seg
+        work = anchor + alpha.unsqueeze(1) * seg
 
     inter = findSelfIntersections(
         work, faces, inflate=0.0, exclude_ring=exclude_ring,
