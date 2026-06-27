@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import time
 import torch
 import numpy as np
@@ -26,6 +27,8 @@ from non_rigid_icp.Method.error_field import (
     localizeHighErrorFaces,
     localizePlateauHighErrorFaces,
     localizeSaggingFaces,
+    localizeRatioSaggingFaces,
+    localizeAboveMeanCentroidFaces,
 )
 from non_rigid_icp.Method.subdivision import subdivideMarkedFaces
 from non_rigid_icp.Method.fit_state import (
@@ -41,7 +44,14 @@ from non_rigid_icp.Method.collision import (
 from non_rigid_icp.Method.self_intersection import findSelfIntersections
 from non_rigid_icp.Method.trajectory_guard import (
     largestSafeStep,
+    earliestSafeStep,
     segmentMeshIntersections,
+    segmentMeshIntersectionParams,
+    earliestSegmentMeshHits,
+)
+from non_rigid_icp.Method.front_advance import (
+    frontAdvancingStep,
+    penetrationRelaxStep,
 )
 from non_rigid_icp.Method.spatial_hash import triangleAABBs, estimateCellSize
 from non_rigid_icp.Method.implicit_field import ImplicitField
@@ -158,6 +168,12 @@ class WatertightFitter(object):
         trajectory_inflate_tau: float = 0.0,
         trajectory_max_active: int = 4000000,
         trajectory_seg_chunk: int = 200000,
+        # Parametric pull-back clearance (in tau): after computing each crossing
+        # vertex's earliest crossing parameter t_min along its OWN ref->current
+        # segment, it is placed at t_min minus this many tau (converted to a
+        # fraction of the segment length), so the safe point sits strictly on the
+        # rest side of the pierced sheet rather than exactly on it.
+        trajectory_clearance_tau: float = 0.05,
         # --- final acceptance ---
         strict_no_intersection: bool = True,
         # --- adaptive subdivision ---
@@ -189,6 +205,24 @@ class WatertightFitter(object):
         refine_sag_mult: float = 2.0,
         refine_centroid_mult: float = 2.0,
         refine_sag_quantile: float = 0.0,
+        # RATIO criterion (user spec, takes precedence over the sag-DIFF above
+        # when refine_ratio > 0): split a face when
+        #   d(centroid,T)/mean_i d(v_i,T) > refine_ratio  AND
+        #   d(centroid,T) > refine_centroid_mult*tau.
+        # The denominator (mean corner distance) is floored at
+        # refine_ratio_denom_eps_tau*tau so corners sitting ~on the target cannot
+        # make the ratio explode. Set refine_ratio<=0 to use the sag-DIFF path.
+        refine_ratio: float = 0.0,
+        refine_ratio_denom_eps_tau: float = 0.25,
+        # ABOVE-MEAN criterion (user spec, highest precedence when
+        # refine_above_mean is True): split every face whose centroid distance to
+        # the target exceeds mean_mult * (mean centroid distance over ALL faces).
+        # Adaptive + parameter-free: the bar tightens as the fit improves.
+        # `refine_min_centroid_tau` optionally floors it so faces already within
+        # tolerance are never split.
+        refine_above_mean: bool = False,
+        refine_mean_mult: float = 1.0,
+        refine_min_centroid_tau: float = 0.0,
         # --- unoptimizable-vertex state machine (clamped stepwise path) ---
         unopt_error_tau: float = 1.0,
         unopt_min_intended_move_tau: float = 0.02,
@@ -270,6 +304,7 @@ class WatertightFitter(object):
         self.trajectory_inflate_tau = trajectory_inflate_tau
         self.trajectory_max_active = trajectory_max_active
         self.trajectory_seg_chunk = trajectory_seg_chunk
+        self.trajectory_clearance_tau = trajectory_clearance_tau
 
         self.strict_no_intersection = strict_no_intersection
 
@@ -286,6 +321,11 @@ class WatertightFitter(object):
         self.refine_sag_mult = refine_sag_mult
         self.refine_centroid_mult = refine_centroid_mult
         self.refine_sag_quantile = refine_sag_quantile
+        self.refine_ratio = refine_ratio
+        self.refine_ratio_denom_eps_tau = refine_ratio_denom_eps_tau
+        self.refine_above_mean = refine_above_mean
+        self.refine_mean_mult = refine_mean_mult
+        self.refine_min_centroid_tau = refine_min_centroid_tau
 
         self.unopt_error_tau = unopt_error_tau
         self.unopt_min_intended_move_tau = unopt_min_intended_move_tau
@@ -465,6 +505,9 @@ class WatertightFitter(object):
         # grid cell size for the trajectory broad phase is tessellation-scale and
         # stable within a topology; cache it (recomputed after each subdivision).
         self._traj_cell_size = None
+        # diagnostic clean-ref triangle-triangle baseline depends on the current
+        # topology, so invalidate it whenever the topology changes.
+        self._diag_baseline_keys = None
 
     def _deformed(self) -> torch.Tensor:
         return self._verts + self._disp
@@ -1229,6 +1272,67 @@ class WatertightFitter(object):
         (see `localizePlateauHighErrorFaces`); otherwise the legacy global
         high-error localizer is used (the Adam `fit()` path)."""
         deformed = self._deformed().detach()
+        # ABOVE-MEAN path (user spec, highest precedence): split every face whose
+        # centroid distance to the target exceeds mean_mult * the global mean
+        # centroid distance -- an adaptive, parameter-free bar that tightens as
+        # the fit improves.
+        if (
+            use_local_plateau
+            and self.refine_above_mean
+            and getattr(self, "_field", None) is not None
+        ):
+            region_mask, _cd, stats = localizeAboveMeanCentroidFaces(
+                deformed,
+                self._faces,
+                self._field,
+                self._face_adj,
+                tau=self._tau_norm,
+                mean_mult=self.refine_mean_mult,
+                min_centroid_tau=self.refine_min_centroid_tau,
+                min_component_faces=self.min_component_faces,
+                dilation_rings=self.dilation_rings,
+                max_faces=self.max_refine_faces,
+            )
+            print(
+                f"[INFO][WatertightFitter] refine(above-mean) level {level}: "
+                f"{stats['n_region']} faces "
+                f"(above_mean={stats['n_above_mean']}, "
+                f"mean_cd={stats['centroid_dist_mean_tau']:.3f}tau, "
+                f"thr={stats['threshold']:.6f}, "
+                f"cent_dist_max={stats['centroid_dist_max']:.6f})."
+            )
+            return region_mask, stats
+        # RATIO path (user spec): split faces whose centroid is proportionally
+        # much farther from the target than their corners
+        # (d(centroid)/mean d(verts) > refine_ratio). Takes precedence over the
+        # sag-DIFF path when refine_ratio > 0.
+        if (
+            use_local_plateau
+            and self.refine_ratio > 0.0
+            and getattr(self, "_field", None) is not None
+        ):
+            region_mask, _ratio, stats = localizeRatioSaggingFaces(
+                deformed,
+                self._faces,
+                self._field,
+                self._face_adj,
+                tau=self._tau_norm,
+                ratio=self.refine_ratio,
+                centroid_mult=self.refine_centroid_mult,
+                denom_eps_tau=self.refine_ratio_denom_eps_tau,
+                min_component_faces=self.min_component_faces,
+                dilation_rings=self.dilation_rings,
+                max_faces=self.max_refine_faces,
+            )
+            print(
+                f"[INFO][WatertightFitter] refine(ratio) level {level}: "
+                f"{stats['n_region']} faces "
+                f"(sagging={stats['n_sagging']}, "
+                f"ratio_thr={stats['ratio_threshold']:.3f}, "
+                f"ratio_max={stats['ratio_max']:.3f}, "
+                f"cent_dist_max={stats['centroid_dist_max']:.6f})."
+            )
+            return region_mask, stats
         # PREFERRED (stepwise) path: refine only faces whose INTERIOR sags off
         # the target while their corners are already on it -- the only faces
         # worth splitting for "the whole surface on the target", measured with
@@ -1817,12 +1921,20 @@ class WatertightFitter(object):
     # gradient-descent stepwise with per-vertex step clamp (user spec)   #
     # ------------------------------------------------------------------ #
     def _fullTrajectoryPullback(
-        self, ids: torch.Tensor, n_bisect: int
+        self, ids: torch.Tensor, n_bisect: int = 0
     ) -> Tuple[int, int]:
         """Check the segment ref->current of every vertex in `ids` against ANY
         triangle of the current mesh; for each segment that pierces a face, move
         the vertex back along the segment by the MINIMUM distance that leaves the
-        segment free of any face crossing (== largest safe fraction, bisected).
+        segment free of any face crossing.
+
+        The pull-back is now CLOSED-FORM: the crossing parameter t (t=0 rest,
+        t=1 current) is solved analytically per (segment, face) candidate pair,
+        reduced to each segment's EARLIEST crossing t_min, and the vertex is
+        placed at the fraction t_min minus a small clearance along its own
+        segment -- no bisection ladder. This is exactly "move back the minimum
+        distance that removes all crossings", and it is what makes the per-step
+        crossing count drop to zero deterministically.
 
         Differs from `_applyTrajectoryGuard` in two deliberate ways matching the
         user's spec: (a) the broad phase is the FULL mesh (face_ids=None), not the
@@ -1836,23 +1948,37 @@ class WatertightFitter(object):
         ref = self._ref_verts.detach()
         cell = self._trajCellSize(cur)
         chunk = self.trajectory_seg_chunk
+        clearance = self.trajectory_clearance_tau * self._tau_norm
         clamp_id_parts, clamp_pos_parts = [], []
         for start in range(0, ids.numel(), chunk):
             sub = ids[start:start + chunk]
-            safe_pos, need = largestSafeStep(
-                ref[sub],
-                cur[sub],
-                cur,
-                self._faces,
-                owner_vid=sub,
-                inflate=0.0,
-                n_bisect=n_bisect,
-                cell_size=cell,
-                face_ids=None,  # ANY triangle (full mesh)
+            r = ref[sub]
+            c = cur[sub]
+            hit_seg, hit_face, hit_t = segmentMeshIntersectionParams(
+                r, c, cur, self._faces, owner_vid=sub,
+                inflate=0.0, cell_size=cell, face_ids=None,  # ANY triangle
             )
-            if bool(need.any()):
-                clamp_id_parts.append(sub[need])
-                clamp_pos_parts.append(safe_pos[need])
+            if hit_seg.numel() == 0:
+                continue
+            t_min, _ = earliestSegmentMeshHits(
+                hit_seg, hit_face, hit_t, sub.numel()
+            )
+            need = torch.isfinite(t_min)
+            if not bool(need.any()):
+                continue
+            # convert the (distance) clearance into a per-segment parametric
+            # back-off; degenerate (near-zero-length) segments fall back to the
+            # rest position (alpha=0).
+            seg_len = (c - r).norm(dim=1)
+            clearance_t = torch.where(
+                seg_len > 1e-12,
+                clearance / seg_len.clamp_min(1e-12),
+                torch.ones_like(seg_len),
+            )
+            alpha = torch.clamp(t_min - clearance_t, min=0.0, max=1.0)
+            safe_pos = r + alpha.unsqueeze(1) * (c - r)
+            clamp_id_parts.append(sub[need])
+            clamp_pos_parts.append(safe_pos[need])
         if not clamp_id_parts:
             return 0, int(ids.numel())
         clamp_ids = torch.cat(clamp_id_parts, dim=0)
@@ -1860,6 +1986,393 @@ class WatertightFitter(object):
         with torch.no_grad():
             self._disp.data[clamp_ids] = clamp_pos - self._verts[clamp_ids]
         return int(clamp_ids.numel()), int(ids.numel())
+
+    def _measureTriangleSelfIntersections(self) -> dict:
+        """Authoritative triangle-triangle self-intersection count on the CURRENT
+        deformed mesh, relative to the clean source baseline (so only crossings
+        the FIT created are reported). This is the complement of the trajectory
+        criterion: adjacent faces that fold/overlap without any single vertex's
+        rest->current segment piercing a non-incident face are invisible to the
+        trajectory guard but show up here, which is the diagnostic that tells the
+        two failure modes apart."""
+        cur = self._deformed().detach()
+        inter = findSelfIntersections(
+            cur, self._faces, inflate=0.0, exclude_ring=1,
+            face_adjacency=self._face_adj,
+        )
+        keys = pairKeys(inter, self._faces.shape[0])
+        # honest "new" count needs the clean-source baseline regardless of
+        # whether the self-collision guard (which populates `_baseline_keys`) is
+        # on, so compute + cache it from `_ref_verts` here on first use.
+        baseline = getattr(self, "_diag_baseline_keys", None)
+        if baseline is None:
+            base_inter = findSelfIntersections(
+                self._ref_verts.detach(), self._faces, inflate=0.0,
+                exclude_ring=1, face_adjacency=self._face_adj,
+            )
+            baseline = pairKeys(base_inter, self._faces.shape[0])
+            self._diag_baseline_keys = baseline
+        if baseline.numel() > 0 and keys.numel() > 0:
+            n_new = int((~torch.isin(keys, baseline)).sum().item())
+        else:
+            n_new = int(keys.numel())
+        involved = (
+            int(torch.unique(inter.reshape(-1)).numel())
+            if inter.numel() else 0
+        )
+        return {
+            "tri_intersecting_pairs_total": int(keys.numel()),
+            "tri_intersecting_pairs_new": n_new,
+            "tri_intersecting_faces": involved,
+        }
+
+    def _measureTrajectoryFull(
+        self, ids: Union[torch.Tensor, None] = None
+    ) -> dict:
+        """Diagnostic full-mesh measurement of the trajectory criterion over the
+        given vertex ids (default: all moved vertices). Reports the number of
+        crossing vertices/pairs and the smallest crossing parameter t observed --
+        the quantitative "how badly does the current state cross?" signal used by
+        the single-step debug to verify the detector and the pull-back."""
+        cur = self._deformed().detach()
+        ref = self._ref_verts.detach()
+        v = self._verts.shape[0]
+        if ids is None:
+            ids = torch.arange(v, device=self.device)
+        cell = self._trajCellSize(cur)
+        chunk = self.trajectory_seg_chunk
+        n_pairs = 0
+        n_vertices = 0
+        t_min_global = float("inf")
+        for start in range(0, ids.numel(), chunk):
+            sub = ids[start:start + chunk]
+            hit_seg, hit_face, hit_t = segmentMeshIntersectionParams(
+                ref[sub], cur[sub], cur, self._faces, owner_vid=sub,
+                inflate=0.0, cell_size=cell, face_ids=None,
+            )
+            if hit_seg.numel() == 0:
+                continue
+            n_pairs += int(hit_seg.numel())
+            n_vertices += int(torch.unique(hit_seg).numel())
+            t_min_global = min(t_min_global, float(hit_t.min().item()))
+        return {
+            "trajectory_crossing_vertices": n_vertices,
+            "trajectory_crossing_pairs": n_pairs,
+            "trajectory_min_t": (
+                None if not math.isfinite(t_min_global) else t_min_global
+            ),
+            "trajectory_self_intersection_free": bool(n_vertices == 0),
+        }
+
+    # ------------------------------------------------------------------ #
+    # self-aware single-step projection (user spec)                      #
+    # ------------------------------------------------------------------ #
+    def _selfAwareProjectStep(
+        self,
+        field: "ImplicitField",
+        safe_dist_percent: float = 0.001,
+        t_lo: float = 1e-4,
+    ) -> dict:
+        """ONE self-intersection-free projection step (the user's elegant idea).
+
+        First principles: for every vertex v_i take the segment v_i -> cp_i, with
+        cp_i its EXACT closest point on the target (face-interior). Intersect each
+        segment with the CURRENT (static) source mesh and take the earliest hit
+        parameter t_i (t=0 at v_i, t=1 at cp_i); a segment that hits nothing gets
+        t_i = 1. Then advance every vertex by
+
+            alpha_i = clamp(t_i - safe_dist_percent, 0, 1)
+
+        i.e. each vertex moves AS FAR toward its target as it can without its
+        path reaching any non-incident face. Because every vertex stops strictly
+        before the first face it would meet (with a small parametric clearance),
+        no vertex tunnels a face and no two faces are driven to coincide -- the
+        single step is self-intersection-free by construction.
+
+        Reuses the existing atoms wholesale: `field.closestPoints` (target
+        face-interior closest point), `segmentMeshIntersectionParams` (broad-phase
+        AABB grid + parametric Moller-Trumbore narrow phase) and
+        `earliestSegmentMeshHits` (vectorized per-segment earliest-t reduction).
+        Returns per-step diagnostics.
+        """
+        dev = self.device
+        with torch.no_grad():
+            cur = self._deformed().detach()
+            cp, _, _ = field.closestPoints(cur)
+            d_i = (cp - cur).norm(dim=1)  # uncapped distance to target
+
+            v = cur.shape[0]
+            owner = torch.arange(v, device=dev)
+            cell = self._trajCellSize(cur)
+            chunk = self.trajectory_seg_chunk
+
+            # earliest crossing t of segment v_i -> cp_i against the static mesh
+            t_min = torch.full((v,), float("inf"), device=dev)
+            for start in range(0, v, chunk):
+                sub = owner[start:start + chunk]
+                hit_seg, hit_face, hit_t = segmentMeshIntersectionParams(
+                    cur[sub], cp[sub], cur, self._faces, owner_vid=sub,
+                    inflate=0.0, cell_size=cell, face_ids=None,
+                    t_lo=t_lo, t_hi=1.0,
+                )
+                t_sub, _ = earliestSegmentMeshHits(
+                    hit_seg, hit_face, hit_t, sub.numel()
+                )
+                t_min[start:start + chunk] = t_sub
+
+            crossed = torch.isfinite(t_min)
+            t_eff = torch.where(crossed, t_min, torch.ones_like(t_min))
+            alpha = torch.clamp(t_eff - safe_dist_percent, min=0.0, max=1.0)
+
+            # new position = cur + alpha*(cp-cur); write it through _disp so the
+            # rest of the machinery (eval, save) sees it via _deformed().
+            new_pos = cur + alpha.unsqueeze(1) * (cp - cur)
+            self._disp.data.copy_(new_pos - self._verts)
+
+            resid_after = (cp - new_pos).norm(dim=1)
+        return {
+            "n_vertices": int(v),
+            "n_crossing_segments": int(crossed.sum().item()),
+            "mean_t": float(t_eff.mean().item()),
+            "min_t": float(t_eff.min().item()),
+            "mean_alpha": float(alpha.mean().item()),
+            "fit_residual_before_tau": float(d_i.mean().item()) / self._tau_norm,
+            "fit_residual_after_tau": float(resid_after.mean().item())
+            / self._tau_norm,
+        }
+
+    def fitSelfAwareSingleStep(
+        self,
+        safe_dist_percent: float = 0.001,
+        t_lo: float = 1e-4,
+        save_folder: Union[str, None] = None,
+        crop_eval: bool = True,
+        compute_chamfer: bool = False,
+    ) -> dict:
+        """One self-intersection-free projection step + bbox-restricted metrics.
+
+        Drives every vertex to its target closest point, capped per-vertex by the
+        earliest self-collision along its own segment (see `_selfAwareProjectStep`),
+        then evaluates Chamfer/F1 and the triangle-triangle + vertex-trajectory
+        self-intersection counts inside the configured eval bboxes only.
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = (
+                self.save_result_folder_path or "./output/self_aware_step/"
+            )
+        os.makedirs(save_folder, exist_ok=True)
+        debug_folder = os.path.join(save_folder, "debug")
+
+        tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
+        tF = np.asarray(self.target_mesh.triangles)
+        field = ImplicitField(tV, tF, device=dev)
+        self._field = field
+
+        t0 = time.time()
+        step_info = self._selfAwareProjectStep(
+            field, safe_dist_percent=safe_dist_percent, t_lo=t_lo
+        )
+        t_step = time.time()
+
+        rec = {
+            "method": "self_aware_single_step",
+            "safe_dist_percent": safe_dist_percent,
+            "tau": self._tau_norm / self.norm_scale,
+            **step_info,
+        }
+
+        cur_mesh = self._currentMeshNormalized()
+        if crop_eval:
+            rec.update(
+                self._evaluateMeshCropped(cur_mesh, debug_folder, "self_aware")
+            )
+        if compute_chamfer:
+            cm = self._currentChamfer(cur_mesh)
+            rec["chamfer_l1"] = cm["chamfer_l1"]
+            rec["f1"] = cm.get("f1")
+
+        with torch.no_grad():
+            tri = self._measureTriangleSelfIntersections()
+            traj = self._measureTrajectoryFull()
+        rec.update(tri)
+        rec["trajectory_crossing_vertices"] = traj["trajectory_crossing_vertices"]
+        rec["trajectory_crossing_pairs"] = traj["trajectory_crossing_pairs"]
+
+        rec["t_step_s"] = round(t_step - t0, 1)
+        rec["seconds"] = round(time.time() - t0, 1)
+
+        self._saveStepMesh(save_folder, 0)
+        with open(os.path.join(save_folder, "self_aware_log.json"), "w") as f:
+            json.dump(rec, f, indent=2)
+
+        crop_str = ""
+        for box in self.eval_bboxes:
+            f1v = rec.get(f"{box['name']}_crop_f1")
+            if f1v is not None:
+                crop_str += f"{box['name']}_f1={f1v:.4f}, "
+        print(
+            "[INFO][self-aware-step] "
+            f"V={rec['n_vertices']}, "
+            f"resid={rec['fit_residual_before_tau']:.3f}->"
+            f"{rec['fit_residual_after_tau']:.3f}tau, "
+            f"crossed_segs={rec['n_crossing_segments']}, "
+            f"mean_alpha={rec['mean_alpha']:.4f}, "
+            + crop_str
+            + f"tri_si_new={rec['tri_intersecting_pairs_new']}, "
+            f"traj_cross={rec['trajectory_crossing_vertices']}, "
+            f"{rec['seconds']}s"
+        )
+        print("[INFO][self-aware-step] log saved to",
+              os.path.join(save_folder, "self_aware_log.json"))
+        return rec
+
+    # ------------------------------------------------------------------ #
+    # front-advancing single step (self-intersection-free by construction)#
+    # ------------------------------------------------------------------ #
+    def _frontAdvancingProjectStep(
+        self,
+        field: "ImplicitField",
+        backoff: float = 0.5,
+        relax_iters: int = 40,
+    ) -> dict:
+        """ONE projection step driven to be penetration-free by EXACT relaxation.
+
+        First principles (validated by the diagnostic): the surviving self-
+        intersections of a naive all-at-once projection are genuine through-
+        PENETRATIONS (an edge of one face crossing another's interior) caused by
+        interleaved vertices folding their faces together -- not a vertex
+        tunnelling a static face (which a trajectory test could catch), and not
+        the ~60% near-coplanar CONTACT pairs that the legacy Moller test miscounts.
+
+        So the step (a) projects every vertex onto its target closest point, then
+        (b) relaxes out the exact penetrations: it repeatedly finds the truly
+        penetrating face pairs (`findSelfIntersections(predicate='penetrate')` --
+        precise, no coplanar tolerance) and backs the incident vertices' advance
+        fraction off toward their rest position, where the watertight mesh is
+        penetration-free. Vertices never involved keep the full projection.
+
+        Delegated to `Method/front_advance.penetrationRelaxStep`. Writes the
+        result through `_disp` so eval/save see it via `_deformed()`.
+        """
+        dev = self.device
+        with torch.no_grad():
+            cur = self._deformed().detach()
+            ref = self._ref_verts.detach()
+            cp, _, _ = field.closestPoints(cur)
+            d_i = (cp - cur).norm(dim=1)  # uncapped distance to target
+            cell = self._trajCellSize(cur)
+
+            new_pos, info = penetrationRelaxStep(
+                ref, cur, cp, self._faces,
+                face_adjacency=self._face_adj,
+                cell_size=cell,
+                backoff=backoff,
+                max_iters=relax_iters,
+            )
+            self._disp.data.copy_(new_pos - self._verts)
+            resid_after = (cp - new_pos).norm(dim=1)
+        return {
+            "n_vertices": int(cur.shape[0]),
+            "relax_iters": info["iters"],
+            "pen_pairs_start": info["pen_pairs_start"],
+            "pen_pairs_end": info["pen_pairs_end"],
+            "backed_off_vertices": info["backed_off_vertices"],
+            "pinned_vertices": info["pinned_vertices"],
+            "mean_alpha": info["mean_alpha"],
+            "fit_residual_before_tau": float(d_i.mean().item()) / self._tau_norm,
+            "fit_residual_after_tau": float(resid_after.mean().item())
+            / self._tau_norm,
+        }
+
+    def fitFrontAdvancingSingleStep(
+        self,
+        backoff: float = 0.5,
+        relax_iters: int = 40,
+        save_folder: Union[str, None] = None,
+        crop_eval: bool = True,
+        compute_chamfer: bool = False,
+    ) -> dict:
+        """One penetration-relaxed projection step + bbox-restricted metrics.
+
+        Projects every vertex onto its target closest point, then relaxes out the
+        EXACT through-penetrations (see `_frontAdvancingProjectStep`), and finally
+        evaluates Chamfer/F1 and the authoritative (now penetration-precise)
+        self-intersection counts inside the configured eval bboxes only.
+        """
+        self._setupFit()
+        dev = self.device
+        if save_folder is None:
+            save_folder = (
+                self.save_result_folder_path or "./output/front_advance_step/"
+            )
+        os.makedirs(save_folder, exist_ok=True)
+        debug_folder = os.path.join(save_folder, "debug")
+
+        tV = np.asarray(self.target_mesh.vertices, dtype=np.float32)
+        tF = np.asarray(self.target_mesh.triangles)
+        field = ImplicitField(tV, tF, device=dev)
+        self._field = field
+
+        t0 = time.time()
+        step_info = self._frontAdvancingProjectStep(
+            field, backoff=backoff, relax_iters=relax_iters,
+        )
+        t_step = time.time()
+
+        rec = {
+            "method": "penetration_relax_single_step",
+            "backoff": backoff,
+            "tau": self._tau_norm / self.norm_scale,
+            **step_info,
+        }
+
+        cur_mesh = self._currentMeshNormalized()
+        if crop_eval:
+            rec.update(
+                self._evaluateMeshCropped(cur_mesh, debug_folder, "front_advance")
+            )
+        if compute_chamfer:
+            cm = self._currentChamfer(cur_mesh)
+            rec["chamfer_l1"] = cm["chamfer_l1"]
+            rec["f1"] = cm.get("f1")
+
+        with torch.no_grad():
+            tri = self._measureTriangleSelfIntersections()
+            traj = self._measureTrajectoryFull()
+        rec.update(tri)
+        rec["trajectory_crossing_vertices"] = traj["trajectory_crossing_vertices"]
+        rec["trajectory_crossing_pairs"] = traj["trajectory_crossing_pairs"]
+
+        rec["t_step_s"] = round(t_step - t0, 1)
+        rec["seconds"] = round(time.time() - t0, 1)
+
+        self._saveStepMesh(save_folder, 0)
+        with open(os.path.join(save_folder, "front_advance_log.json"), "w") as f:
+            json.dump(rec, f, indent=2)
+
+        crop_str = ""
+        for box in self.eval_bboxes:
+            f1v = rec.get(f"{box['name']}_crop_f1")
+            if f1v is not None:
+                crop_str += f"{box['name']}_f1={f1v:.4f}, "
+        print(
+            "[INFO][pen-relax-step] "
+            f"V={rec['n_vertices']}, "
+            f"resid={rec['fit_residual_before_tau']:.3f}->"
+            f"{rec['fit_residual_after_tau']:.3f}tau, "
+            f"pen_pairs {rec['pen_pairs_start']}->{rec['pen_pairs_end']} "
+            f"in {rec['relax_iters']} iters, "
+            f"backed_off={rec['backed_off_vertices']}, "
+            f"mean_alpha={rec['mean_alpha']:.4f}, "
+            + crop_str
+            + f"tri_si_new={rec['tri_intersecting_pairs_new']}, "
+            f"{rec['seconds']}s"
+        )
+        print("[INFO][pen-relax-step] log saved to",
+              os.path.join(save_folder, "front_advance_log.json"))
+        return rec
 
     def fitStepwiseClamped(
         self,
@@ -1880,9 +2393,25 @@ class WatertightFitter(object):
         crop_eval: bool = True,
         full_chamfer_each_step: bool = False,
         save_full_each_step: bool = False,
+        refine_every_step: bool = False,
+        trajectory_debug: bool = False,
     ) -> dict:
         """Gradient-descent stepwise fit with a per-vertex step cap + adaptive
         subdivision near convergence (per the spec).
+
+        When `trajectory_debug` is set, each step additionally records a
+        full-mesh measurement of the user trajectory criterion BEFORE and AFTER
+        the pull-back (crossing vertices/pairs and the smallest crossing
+        parameter t), so the detector and the repair can be verified against the
+        known baseline that step_frac=1.0 produces many crossings.
+
+        When `refine_every_step` is True the per-step closest-point projection is
+        treated as already optimal (step_frac=1.0 lands every vertex on the
+        target in one step), so the adaptive subdivision is run AFTER EVERY step
+        (gated only by `level < max_subdivisions`) instead of waiting for a
+        global residual plateau -- each step projects, then splits the faces the
+        refine criterion flags, so the surface is driven onto the target feature
+        by feature.
 
         Each recorded step:
           1. find each vertex's closest point cp_i on the TARGET surface (exact,
@@ -1998,12 +2527,22 @@ class WatertightFitter(object):
                     self._cumulativeMotion() > (pullback_min_move_tau * tau),
                     as_tuple=False,
                 ).reshape(-1)
+            traj_before = None
+            if trajectory_debug:
+                with torch.no_grad():
+                    traj_before = self._measureTrajectoryFull(moved)
             n_repaired_total = 0
             for _ in range(resolve_iters):
                 n_pb, _ = self._fullTrajectoryPullback(moved, n_bisect)
                 n_repaired_total += n_pb
                 if n_pb == 0:
                     break
+            traj_after = None
+            tri_after = None
+            if trajectory_debug:
+                with torch.no_grad():
+                    traj_after = self._measureTrajectoryFull(moved)
+                    tri_after = self._measureTriangleSelfIntersections()
             t_pull = time.time()
 
             # 3b advance the per-vertex optimization state machine. `actual_move`
@@ -2062,6 +2601,28 @@ class WatertightFitter(object):
                 "mean_resid_active_tau": resid_active / tau,
                 "mean_resid_blocked_tau": resid_blocked / tau,
             }
+            if trajectory_debug:
+                rec["trajectory_crossing_vertices_before"] = (
+                    traj_before["trajectory_crossing_vertices"]
+                )
+                rec["trajectory_crossing_pairs_before"] = (
+                    traj_before["trajectory_crossing_pairs"]
+                )
+                rec["trajectory_min_t_before"] = traj_before["trajectory_min_t"]
+                rec["trajectory_crossing_vertices_after"] = (
+                    traj_after["trajectory_crossing_vertices"]
+                )
+                rec["trajectory_crossing_pairs_after"] = (
+                    traj_after["trajectory_crossing_pairs"]
+                )
+                rec["trajectory_min_t_after"] = traj_after["trajectory_min_t"]
+                rec["tri_intersecting_pairs_new"] = (
+                    tri_after["tri_intersecting_pairs_new"]
+                )
+                rec["tri_intersecting_pairs_total"] = (
+                    tri_after["tri_intersecting_pairs_total"]
+                )
+                rec["tri_intersecting_faces"] = tri_after["tri_intersecting_faces"]
             cur_mesh = None
             if crop_eval or full_chamfer_each_step or save_full_each_step:
                 cur_mesh = self._currentMeshNormalized()
@@ -2082,7 +2643,13 @@ class WatertightFitter(object):
             rec["rel_drop"] = monitor.last_rel_drop
             rec["abs_drop_tau"] = monitor.last_abs_drop
             rec["plateau"] = bool(plateau)
-            do_subdivide = plateau and level < max_subdivisions
+            # `refine_every_step`: the single-step projection is already optimal,
+            # so subdivide every step (only level-capped); otherwise wait for the
+            # residual plateau as before.
+            if refine_every_step:
+                do_subdivide = level < max_subdivisions
+            else:
+                do_subdivide = plateau and level < max_subdivisions
             if save_full_each_step or step == n_steps - 1 or do_subdivide:
                 rec["mesh_path"] = self._saveStepMesh(save_folder, step)
             if do_subdivide:
@@ -2110,7 +2677,12 @@ class WatertightFitter(object):
                 f"resid={resid_tau:.3f}tau, "
                 f"move={rec['mean_step_move_tau']:.4f}tau, "
                 f"repaired={rec['trajectory_repaired_vertices']}, "
-                f"unopt={rec['n_unoptimizable_vertices']}, "
+                + (
+                    f"cross[{rec['trajectory_crossing_vertices_before']}"
+                    f"->{rec['trajectory_crossing_vertices_after']}], "
+                    if trajectory_debug else ""
+                )
+                + f"unopt={rec['n_unoptimizable_vertices']}, "
                 f"rel_drop={monitor.last_rel_drop:.4f}, "
                 + crop_str
                 + (f"subdiv! " if rec.get("subdivided") else "")

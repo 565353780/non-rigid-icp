@@ -63,6 +63,191 @@ def faceSagError(
     return (centroid_dist - mean_vert).clamp(min=0.0)
 
 
+def faceSagRatio(
+    vertex_dist: torch.Tensor,
+    centroid_dist: torch.Tensor,
+    faces: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """The "sag RATIO" of every face:
+
+        ratio(f) = d(centroid(f), target) / mean_i d(v_i, target)
+
+    A scale-free version of `faceSagError`: it asks "is the face interior
+    proportionally much farther from the target than its corners?". After the
+    single-step closest-point projection the corners sit ~on the target, so a
+    flat triangle tented across a target feature has a large ratio while a face
+    lying flat on the target has ratio ~1.
+
+    The mean corner distance is floored at `eps` (an absolute distance, pass
+    e.g. a small multiple of tau) so a face whose corners are essentially ON the
+    target (mean -> 0) does not produce an exploding / meaningless ratio -- the
+    ratio is only trustworthy once the denominator is a real distance. Pair this
+    with an absolute `centroid_dist > k*tau` gate at the call site so sub-tau
+    noise (tiny corner + tiny centroid) is never flagged.
+
+    Returns (F,).
+    """
+    mean_vert = vertex_dist[faces].mean(dim=1).clamp(min=float(eps))
+    return centroid_dist / mean_vert
+
+
+def localizeAboveMeanCentroidFaces(
+    deformed_vertices: torch.Tensor,
+    faces: torch.Tensor,
+    field,
+    face_adjacency: torch.Tensor,
+    tau: float,
+    *,
+    mean_mult: float = 1.0,
+    min_centroid_tau: float = 0.0,
+    min_component_faces: int = 1,
+    dilation_rings: int = 0,
+    max_faces: Union[int, None] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Locate faces to subdivide by the GLOBAL-MEAN centroid-distance criterion
+    (user spec): refine every face whose centroid is farther from the target
+    than the mean over ALL faces, i.e.
+
+        d(centroid(f), T) > mean_mult * mean_g d(centroid(g), T).
+
+    First principles: the goal is to put the WHOLE source surface on the target.
+    After the single-step closest-point projection the vertices sit ~on the
+    target, so the only remaining surface-to-target error is the face interior,
+    measured exactly by the centroid distance (via the closest-point `field`).
+    Using the *running mean* of the centroid distances as the bar makes the
+    threshold adaptive and parameter-free: it automatically tightens as the fit
+    improves (the mean shrinks each round), splits the worse-than-average half,
+    and -- because splitting a face lands its children's centroids closer to the
+    target -- the mean keeps dropping, so the process converges. `mean_mult`
+    tunes how aggressive the cut is (1.0 = strictly above the mean; >1 = only the
+    faces well above the mean -> fewer faces). `min_centroid_tau` is an optional
+    absolute floor (in tau) so faces already within tolerance everywhere are
+    never split even if the mean is tiny -- avoiding chasing sub-tau noise.
+
+    All batched, no Python face loops.
+
+    Returns (region_mask (F,) bool, centroid_dist (F,) float, stats dict).
+    """
+    device = deformed_vertices.device
+    # exact distance of every face CENTROID to the target (face-interior
+    # accurate). The vertices need not be queried: after projection they are ~on
+    # the target, and the criterion is purely about the centroid.
+    centroids = faceCentroids(deformed_vertices, faces)            # (F,3)
+    cp_c, _, _ = field.closestPoints(centroids)
+    cent_dist = (cp_c - centroids).norm(dim=1)                     # (F,)
+
+    mean_cd = float(cent_dist.mean().item()) if cent_dist.numel() else 0.0
+    thr = mean_mult * mean_cd
+    raw_mask = cent_dist > thr
+    if min_centroid_tau > 0.0:
+        raw_mask = raw_mask & (cent_dist > min_centroid_tau * float(tau))
+
+    if max_faces is not None and int(raw_mask.sum().item()) > max_faces:
+        masked = torch.where(raw_mask, cent_dist, torch.full_like(cent_dist, -1.0))
+        topk = torch.topk(masked, max_faces).indices
+        capped = torch.zeros_like(raw_mask)
+        capped[topk] = True
+        raw_mask = capped
+
+    if min_component_faces > 1:
+        labels, sizes = connectedFaceComponents(raw_mask, face_adjacency)
+        if sizes.size > 0:
+            small = np.nonzero(sizes < min_component_faces)[0]
+            if small.size > 0:
+                cleaned_np = raw_mask.detach().cpu().numpy().copy()
+                cleaned_np[np.isin(labels, small)] = False
+                raw_mask = torch.from_numpy(cleaned_np).to(device)
+    region_mask = (
+        dilateFaceMask(raw_mask, face_adjacency, dilation_rings)
+        if dilation_rings > 0 else raw_mask
+    )
+
+    stats = {
+        "tau": float(tau),
+        "centroid_dist_mean": mean_cd,
+        "centroid_dist_mean_tau": mean_cd / float(tau) if tau else 0.0,
+        "centroid_dist_max": float(cent_dist.max().item()) if cent_dist.numel() else 0.0,
+        "threshold": float(thr),
+        "n_above_mean": int(raw_mask.sum().item()),
+        "n_region": int(region_mask.sum().item()),
+    }
+    return region_mask, cent_dist, stats
+
+
+def localizeRatioSaggingFaces(
+    deformed_vertices: torch.Tensor,
+    faces: torch.Tensor,
+    field,
+    face_adjacency: torch.Tensor,
+    tau: float,
+    *,
+    ratio: float = 1.2,
+    centroid_mult: float = 1.0,
+    denom_eps_tau: float = 0.25,
+    min_component_faces: int = 1,
+    dilation_rings: int = 0,
+    max_faces: Union[int, None] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """Locate faces to subdivide by the centroid/vertex distance RATIO criterion
+    (user spec): refine a face when
+
+        d(centroid, T) / mean_i d(v_i, T) > ratio        (interior proportionally
+                                                          farther than corners)
+        AND  d(centroid, T) > centroid_mult * tau         (and absolutely out of
+                                                          tolerance, so sub-tau
+                                                          noise is never split).
+
+    The denominator is floored at `denom_eps_tau * tau` so corners sitting ~on
+    the target cannot make the ratio explode. Uses the exact closest-point
+    `field` (centroid-accurate). All batched, no Python face loops.
+
+    Returns (region_mask (F,) bool, ratio_per_face (F,) float, stats dict).
+    """
+    device = deformed_vertices.device
+    cp_v, _, _ = field.closestPoints(deformed_vertices)
+    vert_dist = (cp_v - deformed_vertices).norm(dim=1)              # (V,)
+    centroids = faceCentroids(deformed_vertices, faces)            # (F,3)
+    cp_c, _, _ = field.closestPoints(centroids)
+    cent_dist = (cp_c - centroids).norm(dim=1)                     # (F,)
+
+    eps = denom_eps_tau * float(tau)
+    ratio_f = faceSagRatio(vert_dist, cent_dist, faces, eps)       # (F,)
+
+    raw_mask = (ratio_f > float(ratio)) & (cent_dist > centroid_mult * float(tau))
+
+    if max_faces is not None and int(raw_mask.sum().item()) > max_faces:
+        masked = torch.where(raw_mask, ratio_f, torch.full_like(ratio_f, -1.0))
+        topk = torch.topk(masked, max_faces).indices
+        capped = torch.zeros_like(raw_mask)
+        capped[topk] = True
+        raw_mask = capped
+
+    if min_component_faces > 1:
+        labels, sizes = connectedFaceComponents(raw_mask, face_adjacency)
+        if sizes.size > 0:
+            small = np.nonzero(sizes < min_component_faces)[0]
+            if small.size > 0:
+                cleaned_np = raw_mask.detach().cpu().numpy().copy()
+                cleaned_np[np.isin(labels, small)] = False
+                raw_mask = torch.from_numpy(cleaned_np).to(device)
+    region_mask = (
+        dilateFaceMask(raw_mask, face_adjacency, dilation_rings)
+        if dilation_rings > 0 else raw_mask
+    )
+
+    stats = {
+        "tau": float(tau),
+        "ratio_threshold": float(ratio),
+        "ratio_max": float(ratio_f.max().item()) if ratio_f.numel() else 0.0,
+        "centroid_dist_max": float(cent_dist.max().item()) if cent_dist.numel() else 0.0,
+        "vert_dist_mean": float(vert_dist.mean().item()) if vert_dist.numel() else 0.0,
+        "n_sagging": int(raw_mask.sum().item()),
+        "n_region": int(region_mask.sum().item()),
+    }
+    return region_mask, ratio_f, stats
+
+
 def localizeSaggingFaces(
     deformed_vertices: torch.Tensor,
     faces: torch.Tensor,

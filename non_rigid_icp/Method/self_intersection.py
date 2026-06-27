@@ -25,7 +25,10 @@ from non_rigid_icp.Method.spatial_hash import (
     cellPairChunk,
     aabbOverlap,
 )
-from non_rigid_icp.Method.collision import detectIntersectingPairs
+from non_rigid_icp.Method.collision import (
+    detectIntersectingPairs,
+    detectPenetratingPairs,
+)
 from non_rigid_icp.Method.topology import (
     facePairsShareVertex,
     buildFaceAdjacency,
@@ -86,8 +89,18 @@ def findSelfIntersections(
     restrict_to_query: bool = False,
     pair_chunk: int = 40_000_000,
     narrow_chunk: int = 4_000_000,
+    predicate: str = "penetrate",
 ) -> torch.Tensor:
     """Return (Q, 2) face pairs that actually intersect (non-adjacent).
+
+    `predicate` selects the EXACT narrow-phase rule:
+        'penetrate' (default): a pair counts iff some edge of one triangle
+            strictly crosses the interior of the other -- a true through-
+            penetration, with NO coplanar/contact tolerance. This is the precise
+            watertight self-intersection predicate.
+        'moller': the legacy Moller test, which additionally flags near-coplanar
+            resting CONTACT (two sheets on the same surface) via its coplanar
+            distance fallback. Kept for backward comparison only.
 
     Args:
         inflate: AABB inflation. 0 for exact intersection; >0 to also surface
@@ -146,7 +159,14 @@ def findSelfIntersections(
         pr = pr[~shared]
         if pr.numel() == 0:
             continue
-        hit = detectIntersectingPairs(vertices, index_faces, pr, chunk=narrow_chunk)
+        if predicate == "moller":
+            hit = detectIntersectingPairs(
+                vertices, index_faces, pr, chunk=narrow_chunk
+            )
+        else:
+            hit = detectPenetratingPairs(
+                vertices, index_faces, pr, chunk=narrow_chunk
+            )
         if bool(hit.any()):
             hits.append(pr[hit])
 

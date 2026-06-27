@@ -18,7 +18,16 @@ from non_rigid_icp.Data.mesh import Mesh
 from non_rigid_icp.Module.watertight_fitter import WatertightFitter
 from non_rigid_icp.Method.trajectory_guard import (
     segmentMeshIntersections,
+    segmentMeshIntersectionParams,
+    earliestSegmentMeshHits,
     largestSafeStep,
+    earliestSafeStep,
+)
+from non_rigid_icp.Method.geometry import segmentTriangleIntersectParams
+from non_rigid_icp.Method.triton_kernels import (
+    segmentTrianglePairHits,
+    segmentTrianglePairParams,
+    tritonAvailable,
 )
 
 
@@ -105,6 +114,119 @@ def test_largest_safe_step_hits_and_pullback():
     assert float(safe[0, 2]) < 1.0, "safe position must have advanced from rest"
     assert hit_seg.numel() >= 1 and 0 in set(hit_face.tolist())
     print("  test_largest_safe_step_hits_and_pullback PASSED")
+
+
+def test_param_atom_t_value():
+    """A vertical segment from z=+1 to z=-1 through the z=0 sheet pierces at the
+    geometric midpoint, so the parameter t must be exactly 0.5."""
+    p = torch.tensor([[0.0, 0.0, 1.0]], device=DEV)
+    q = torch.tensor([[0.0, 0.0, -1.0]], device=DEV)
+    a = torch.tensor([[-1.0, -1.0, 0.0]], device=DEV)
+    b = torch.tensor([[1.0, -1.0, 0.0]], device=DEV)
+    c = torch.tensor([[-1.0, 1.0, 0.0]], device=DEV)
+    hit, t, u, v = segmentTriangleIntersectParams(p, q, a, b, c)
+    assert bool(hit[0])
+    assert abs(float(t[0]) - 0.5) < 1e-5, float(t[0])
+
+    # raising t_lo above the rest endpoint should not affect a midpoint crossing
+    hit2, t2, _, _ = segmentTriangleIntersectParams(p, q, a, b, c, t_lo=0.01)
+    assert bool(hit2[0]) and abs(float(t2[0]) - 0.5) < 1e-5
+
+    # a segment that only touches the sheet at its REST endpoint (t=0) is a hit
+    # under the default window but excluded once t_lo is lifted above 0.
+    p0 = torch.tensor([[0.0, 0.0, 0.0]], device=DEV)  # on the sheet
+    q0 = torch.tensor([[0.0, 0.0, 1.0]], device=DEV)  # moves away
+    hit_def, _, _, _ = segmentTriangleIntersectParams(p0, q0, a, b, c)
+    hit_eps, t_eps, _, _ = segmentTriangleIntersectParams(
+        p0, q0, a, b, c, t_lo=1e-3
+    )
+    assert bool(hit_def[0]), "default window keeps the t=0 rest touch"
+    assert not bool(hit_eps[0]), "t_lo>0 must drop the rest-endpoint touch"
+    assert not torch.isfinite(t_eps[0]), "dropped pairs get t=+inf"
+    print("  test_param_atom_t_value PASSED")
+
+
+def test_earliest_hit_reduction():
+    """Two parallel sheets at z=0.25 and z=0.75; a segment from z=1 to z=0 must
+    report the EARLIEST crossing (closest to rest, smaller t) -- the z=0.75 sheet
+    at t=0.25, not the z=0.25 sheet at t=0.75."""
+    verts = torch.tensor(
+        [
+            [-1.0, -1.0, 0.25], [1.0, -1.0, 0.25], [-1.0, 1.0, 0.25],  # low sheet
+            [-1.0, -1.0, 0.75], [1.0, -1.0, 0.75], [-1.0, 1.0, 0.75],  # high sheet
+            [0.0, 0.0, 1.0],  # mover (id 6), rest above both sheets
+        ],
+        device=DEV,
+    )
+    faces = torch.tensor([[0, 1, 2], [3, 4, 5]], device=DEV, dtype=torch.long)
+    ref = verts[6:7].clone()
+    cur = ref.clone()
+    cur[0, 2] = 0.0  # tunnels through both sheets
+    owner = torch.tensor([6], device=DEV, dtype=torch.long)
+
+    hit_seg, hit_face, hit_t = segmentMeshIntersectionParams(
+        ref, cur, verts, faces, owner
+    )
+    assert hit_seg.numel() == 2, hit_seg.tolist()
+    t_min, face_min = earliestSegmentMeshHits(hit_seg, hit_face, hit_t, 1)
+    # rest is z=1, current z=0, span 1.0: z=0.75 sheet is at t=0.25 (earliest).
+    assert abs(float(t_min[0]) - 0.25) < 1e-5, float(t_min[0])
+    assert int(face_min[0]) == 1, "earliest crossing is the HIGH sheet (face 1)"
+    print("  test_earliest_hit_reduction PASSED")
+
+
+def test_earliest_safe_step_min_pullback():
+    """earliestSafeStep places the vertex just before its first crossing, in one
+    closed-form step (matching largestSafeStep's bisection to clearance)."""
+    verts, faces = _flat_sheet()
+    ref = verts[4:5].clone()  # z = 1
+    proposed = ref.clone()
+    proposed[0, 2] = -1.0  # tunnels to z=-1, crossing the z=0 sheet at t=0.5
+    owner = torch.tensor([4], device=DEV, dtype=torch.long)
+
+    safe, clamped, hit_seg, hit_face = earliestSafeStep(
+        ref, proposed, verts, faces, owner_vid=owner,
+        clearance_t=1e-3, return_hits=True,
+    )
+    assert bool(clamped[0])
+    # crossing at t=0.5 (z=0); pulled back to t=0.5-clearance -> z slightly >0.
+    z = float(safe[0, 2])
+    assert 0.0 < z < 0.01, z
+    assert hit_seg.numel() == 1 and int(hit_face[0]) == 0
+    print("  test_earliest_safe_step_min_pullback PASSED")
+
+
+def test_triton_param_matches_torch():
+    """The Triton parameter kernel matches the torch fallback on random pairs
+    (both the boolean pierce flag and the parameter t where finite)."""
+    if not (tritonAvailable() and DEV == "cuda"):
+        print("  test_triton_param_matches_torch SKIPPED (no triton/cuda)")
+        return
+    g = torch.Generator(device=DEV).manual_seed(0)
+    s, t_, p = 200, 200, 50000
+    ss = torch.rand(s, 3, device=DEV, generator=g)
+    se = torch.rand(s, 3, device=DEV, generator=g)
+    va = torch.rand(t_, 3, device=DEV, generator=g)
+    vb = torch.rand(t_, 3, device=DEV, generator=g)
+    vc = torch.rand(t_, 3, device=DEV, generator=g)
+    seg_id = torch.randint(0, s, (p,), device=DEV, generator=g)
+    tri_id = torch.randint(0, t_, (p,), device=DEV, generator=g)
+
+    t_k = segmentTrianglePairParams(seg_id, tri_id, ss, se, va, vb, vc)
+    _, t_ref, _, _ = segmentTriangleIntersectParams(
+        ss[seg_id], se[seg_id], va[tri_id], vb[tri_id], vc[tri_id]
+    )
+    # both agree on which pairs are hits (finite t)
+    assert torch.equal(torch.isfinite(t_k), torch.isfinite(t_ref))
+    fin = torch.isfinite(t_k)
+    if bool(fin.any()):
+        assert torch.allclose(t_k[fin], t_ref[fin], atol=1e-4), (
+            (t_k[fin] - t_ref[fin]).abs().max().item()
+        )
+    # the boolean kernel must agree with finiteness of the parameter kernel
+    hit_b = segmentTrianglePairHits(seg_id, tri_id, ss, se, va, vb, vc)
+    assert torch.equal(hit_b, fin)
+    print("  test_triton_param_matches_torch PASSED")
 
 
 def _sphere(radius: float, resolution: int = 24, flip: bool = False):
@@ -210,6 +332,14 @@ def main():
     test_local_face_scope()
     print("[test] largestSafeStep hits + pullback")
     test_largest_safe_step_hits_and_pullback()
+    print("[test] parametric atom t value + endpoint window")
+    test_param_atom_t_value()
+    print("[test] earliest-hit reduction (two sheets)")
+    test_earliest_hit_reduction()
+    print("[test] earliestSafeStep minimum pull-back")
+    test_earliest_safe_step_min_pullback()
+    print("[test] triton param kernel matches torch")
+    test_triton_param_matches_torch()
     print("[test] v4 integration (double-layer collapse)")
     test_v4_integration()
     print("\nALL V4 TRAJECTORY GUARD TESTS PASSED")

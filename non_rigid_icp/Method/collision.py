@@ -22,6 +22,7 @@ from typing import Tuple, Union
 
 from non_rigid_icp.Method.geometry import (
     triangleTriangleIntersects,
+    triangleTrianglePenetrate,
     triangleTriangleDistance2,
 )
 from non_rigid_icp.Method.topology import facePairsShareVertex
@@ -280,6 +281,32 @@ def detectIntersectingPairs(
         sub = pairs[start : start + chunk]
         tri1, tri2 = gatherTrianglePairs(vertices, faces, sub)
         out[start : start + chunk] = triangleTriangleIntersects(tri1, tri2)
+    return out
+
+
+def detectPenetratingPairs(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    pairs: torch.Tensor,
+    chunk: int = 2000000,
+    eps: float = 0.0,
+) -> torch.Tensor:
+    """Boolean mask over `pairs`: which face pairs TRULY interpenetrate.
+
+    Exact-arithmetic narrow phase: a pair counts iff some edge of one triangle
+    strictly crosses the interior of the other (`triangleTrianglePenetrate`).
+    Unlike `detectIntersectingPairs` (Moller, which flags near-coplanar resting
+    CONTACT via its coplanar/touch fallback), this only flags genuine
+    through-penetration -- the precise predicate for watertight self-intersection.
+    """
+    p = pairs.shape[0]
+    if p == 0:
+        return torch.zeros(0, dtype=torch.bool, device=faces.device)
+    out = torch.zeros(p, dtype=torch.bool, device=faces.device)
+    for start in range(0, p, chunk):
+        sub = pairs[start : start + chunk]
+        tri1, tri2 = gatherTrianglePairs(vertices, faces, sub)
+        out[start : start + chunk] = triangleTrianglePenetrate(tri1, tri2, eps=eps)
     return out
 
 

@@ -16,12 +16,25 @@ only the (segment, triangle) cross pairs are kept. Candidate generation runs onc
 per resolve; the bisection then only re-runs the (cheap) narrow phase on that
 fixed candidate set, because shrinking the step only shrinks each segment's AABB
 (its candidate triangles stay a subset).
+
+The narrow phase comes in two flavours: a boolean pierce test (the cheap gate /
+bisection ladder, `segmentTrianglePairHits`) and a PARAMETRIC test that returns
+the crossing parameter ``t`` (`segmentTrianglePairParams`). ``t = 0`` is the rest
+endpoint and ``t = 1`` the current endpoint, so reducing a segment's candidate
+pairs to their smallest ``t`` (`earliestSegmentMeshHits`) gives the FIRST face it
+tunnels into, and `earliestSafeStep` pulls the vertex back to just before that
+crossing in one closed-form step -- no bisection. This is both the minimum-
+distance pull-back the fitter applies and the diagnostic that quantifies how
+badly a step crosses (min ``t``, number of crossing vertices/pairs).
 """
 
 import torch
 from typing import Tuple, Union
 
-from non_rigid_icp.Method.triton_kernels import segmentTrianglePairHits
+from non_rigid_icp.Method.triton_kernels import (
+    segmentTrianglePairHits,
+    segmentTrianglePairParams,
+)
 from non_rigid_icp.Method.spatial_hash import (
     triangleAABBs,
     estimateCellSize,
@@ -199,6 +212,118 @@ def _narrow_seg_pairs(
     return out
 
 
+def _narrow_seg_params(
+    seg_start: torch.Tensor,
+    seg_end: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    cand_seg: torch.Tensor,
+    cand_tri: torch.Tensor,
+    t_lo: float = 0.0,
+    t_hi: float = 1.0,
+    narrow_chunk: int = 8_000_000,
+) -> torch.Tensor:
+    """Per-candidate-pair crossing parameter ``t`` (``+inf`` for non-hits).
+
+    The ``t``-valued sibling of `_narrow_seg_pairs`: aligned with the candidate
+    pair arrays so the caller can reduce to each segment's earliest crossing.
+    ``t = 0`` is the segment's rest endpoint, ``t = 1`` its current endpoint."""
+    p = cand_seg.shape[0]
+    if p == 0:
+        return torch.zeros(0, device=faces.device)
+    out = torch.empty(p, device=faces.device)
+    va = vertices[faces[:, 0]]
+    vb = vertices[faces[:, 1]]
+    vc = vertices[faces[:, 2]]
+    for start in range(0, p, narrow_chunk):
+        sl = slice(start, start + narrow_chunk)
+        out[sl] = segmentTrianglePairParams(
+            cand_seg[sl], cand_tri[sl], seg_start, seg_end, va, vb, vc,
+            t_lo=t_lo, t_hi=t_hi,
+        )
+    return out
+
+
+def segmentMeshIntersectionParams(
+    seg_start: torch.Tensor,
+    seg_end: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    owner_vid: torch.Tensor,
+    inflate: float = 0.0,
+    cell_size: Union[float, None] = None,
+    face_ids: Union[torch.Tensor, None] = None,
+    t_lo: float = 0.0,
+    t_hi: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-pair segment-mesh crossings WITH the segment parameter ``t``.
+
+    The parametric form of `segmentMeshIntersections`: for the broad-phase
+    candidate pairs that actually pierce a non-incident face, return the aligned
+    ``(hit_seg, hit_face, hit_t)`` arrays, where ``hit_t`` is the segment
+    parameter of the crossing (``t = 0`` rest, ``t = 1`` current). Feeding these
+    to `earliestSegmentMeshHits` yields, per segment, the FIRST face its
+    trajectory tunnels into -- the minimum pull-back target.
+    """
+    z = torch.zeros(0, dtype=torch.long, device=faces.device)
+    zf = torch.zeros(0, device=faces.device)
+    cand_seg, cand_tri = segmentMeshCandidates(
+        seg_start,
+        seg_end,
+        vertices,
+        faces,
+        owner_vid,
+        inflate=inflate,
+        cell_size=cell_size,
+        face_ids=face_ids,
+    )
+    if cand_seg.numel() == 0:
+        return z, z, zf
+    t_pair = _narrow_seg_params(
+        seg_start, seg_end, vertices, faces, cand_seg, cand_tri,
+        t_lo=t_lo, t_hi=t_hi,
+    )
+    pair_hit = torch.isfinite(t_pair)
+    return cand_seg[pair_hit], cand_tri[pair_hit], t_pair[pair_hit]
+
+
+def earliestSegmentMeshHits(
+    hit_seg: torch.Tensor,
+    hit_face: torch.Tensor,
+    hit_t: torch.Tensor,
+    n_seg: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reduce per-pair crossings to each segment's EARLIEST (smallest-``t``) one.
+
+    Args:
+        hit_seg/hit_face/hit_t: aligned per-pair crossings (from
+            `segmentMeshIntersectionParams`).
+        n_seg: number of segments tested.
+
+    Returns:
+        t_min: (n_seg,) earliest crossing parameter per segment (``+inf`` where a
+            segment never crossed).
+        face_min: (n_seg,) the face id at that earliest crossing (``-1`` where a
+            segment never crossed). Fully vectorized (a scatter-amin to find the
+            per-segment minimum ``t``, then a masked scatter to recover the face
+            achieving it) -- no python per-segment loop.
+    """
+    device = hit_seg.device
+    t_min = torch.full((n_seg,), float("inf"), device=device)
+    face_min = torch.full((n_seg,), -1, dtype=torch.long, device=device)
+    if hit_seg.numel() == 0:
+        return t_min, face_min
+    t_min.scatter_reduce_(0, hit_seg, hit_t, reduce="amin", include_self=True)
+    # recover the face attaining each segment's minimum t: a pair qualifies when
+    # its t equals its segment's reduced minimum (within a tiny tolerance). If
+    # several faces tie, scatter keeps an arbitrary (equally-earliest) one, which
+    # is fine -- they all pierce at the same parameter.
+    seg_tmin = t_min[hit_seg]
+    is_min = (hit_t - seg_tmin).abs() <= 1e-9 * (1.0 + seg_tmin.abs())
+    face_min[hit_seg[is_min]] = hit_face[is_min]
+    return t_min, face_min
+
+
 def segmentsCrossMesh(
     seg_start: torch.Tensor,
     seg_end: torch.Tensor,
@@ -341,4 +466,78 @@ def largestSafeStep(
     safe_pos = ref + alpha.unsqueeze(1) * direction
     if return_hits:
         return safe_pos, need, cand_seg[pair_hit], cand_tri[pair_hit]
+    return safe_pos, need
+
+
+def earliestSafeStep(
+    ref: torch.Tensor,
+    proposed: torch.Tensor,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    owner_vid: torch.Tensor,
+    inflate: float = 0.0,
+    cell_size: Union[float, None] = None,
+    face_ids: Union[torch.Tensor, None] = None,
+    clearance_t: float = 1e-3,
+    t_lo: float = 0.0,
+    t_hi: float = 1.0,
+    return_hits: bool = False,
+):
+    """Pull each segment back to JUST BEFORE its earliest crossing -- no bisect.
+
+    The crossing parameter ``t`` is computed analytically (Moller-Trumbore), so
+    the minimum-distance safe position is one closed-form reduction rather than
+    a `largestSafeStep` bisection ladder: for every segment we take the smallest
+    ``t`` at which its straight trajectory ``ref -> proposed`` first pierces a
+    non-incident face, then place the vertex at
+
+        alpha = clamp(t_min - clearance_t, 0, 1),
+
+    i.e. the largest fraction along its OWN segment that stays before the first
+    crossing (minus a tiny clearance so it lands strictly on the rest side, not
+    exactly on the pierced sheet). This is the exact "move back the minimum
+    distance that removes all crossings" the spec asks for.
+
+    Args:
+        clearance_t: parametric back-off subtracted from ``t_min`` so the safe
+            point sits strictly before the sheet (default 1e-3 of the segment).
+        t_lo/t_hi: crossing parameter window. ``t_lo`` slightly above 0 ignores a
+            pre-existing touch right at the rest endpoint; ``t_hi`` = 1 keeps a
+            crossing where the CURRENT endpoint has landed on another face.
+
+    Returns:
+        safe_pos: (S, 3) pulled-back positions (== proposed where no crossing).
+        clamped:  (S,) bool, True where the segment was pulled back.
+        (if return_hits) hit_seg, hit_face: per-segment earliest-crossing (local
+            segment id, GLOBAL face id) for the clamped segments only.
+    """
+    s = ref.shape[0]
+    z = torch.zeros(0, dtype=torch.long, device=faces.device)
+    if s == 0:
+        empty_bool = torch.zeros(0, dtype=torch.bool, device=faces.device)
+        if return_hits:
+            return proposed, empty_bool, z, z
+        return proposed, empty_bool
+
+    hit_seg, hit_face, hit_t = segmentMeshIntersectionParams(
+        ref, proposed, vertices, faces, owner_vid,
+        inflate=inflate, cell_size=cell_size, face_ids=face_ids,
+        t_lo=t_lo, t_hi=t_hi,
+    )
+    t_min, face_min = earliestSegmentMeshHits(hit_seg, hit_face, hit_t, s)
+    need = torch.isfinite(t_min)
+    if not bool(need.any()):
+        empty_bool = torch.zeros(s, dtype=torch.bool, device=ref.device)
+        if return_hits:
+            return proposed, empty_bool, z, z
+        return proposed, empty_bool
+
+    direction = proposed - ref
+    alpha = torch.ones(s, device=ref.device)
+    safe_alpha = torch.clamp(t_min[need] - clearance_t, min=0.0, max=1.0)
+    alpha[need] = safe_alpha
+    safe_pos = ref + alpha.unsqueeze(1) * direction
+    if return_hits:
+        sel = need
+        return safe_pos, need, torch.nonzero(sel, as_tuple=False).reshape(-1), face_min[sel]
     return safe_pos, need

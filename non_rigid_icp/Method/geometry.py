@@ -216,6 +216,152 @@ def segmentTriangleIntersect(
     return hit
 
 
+def edgeTriangleCross(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    eps: float = 0.0,
+) -> torch.Tensor:
+    """Strict interior crossing of segment [p, q] through triangle (a, b, c).
+
+    Identical Moller-Trumbore arithmetic to `segmentTriangleIntersect` but with
+    STRICT interior tests (``u, v > 0``, ``u + v < 1``, ``0 < t < 1``) so a mere
+    boundary touch (edge grazing a vertex/edge/face plane) is NOT counted -- only
+    a genuine through-penetration is. This is the exact-arithmetic narrow-phase
+    primitive for the triangle-triangle PENETRATION predicate: two triangles
+    truly interpenetrate iff some edge of one strictly crosses the other's
+    interior. No coplanar fallback, no absolute distance tolerance -- the only
+    ``eps`` is the determinant-degeneracy guard (a parallel edge does not pierce).
+
+    Set ``eps = 0`` for the strict predicate (default). A tiny positive ``eps``
+    widens the acceptance symmetrically if a hair of slack is wanted.
+
+    All inputs (P, 3). Returns (P,) bool.
+    """
+    if p.shape[0] == 0:
+        return torch.zeros(0, dtype=torch.bool, device=p.device)
+    d = q - p
+    e1 = b - a
+    e2 = c - a
+    pvec = torch.cross(d, e2, dim=-1)
+    det = _dot(e1, pvec)
+    parallel = det.abs() <= EPS
+    inv_det = 1.0 / torch.where(parallel, torch.ones_like(det), det)
+    tvec = p - a
+    u = _dot(tvec, pvec) * inv_det
+    qvec = torch.cross(tvec, e1, dim=-1)
+    v = _dot(d, qvec) * inv_det
+    t = _dot(e2, qvec) * inv_det
+    hit = (
+        (~parallel)
+        & (u > eps)
+        & (v > eps)
+        & (u + v < 1.0 - eps)
+        & (t > eps)
+        & (t < 1.0 - eps)
+    )
+    return hit
+
+
+def triangleTrianglePenetrate(
+    tri1: torch.Tensor, tri2: torch.Tensor, eps: float = 0.0
+) -> torch.Tensor:
+    """EXACT triangle-triangle penetration: does an edge of one strictly cross
+    the interior of the other?
+
+    Two triangles interpenetrate iff at least one of the six edges (three of
+    each) strictly pierces the interior of the opposing triangle. This is the
+    precise, tolerance-free alternative to `triangleTriangleIntersects` (which
+    uses a coplanar fallback + an absolute touch tolerance and therefore counts
+    near-coplanar CONTACT -- two sheets resting on the same surface -- as an
+    intersection). Built purely from `edgeTriangleCross` (Moller-Trumbore), so a
+    glancing/coplanar contact with no through-penetration is correctly NOT
+    flagged.
+
+    Note: by design this does NOT flag the measure-zero exactly-coplanar overlap
+    case (two triangles in the same plane with overlapping area but no edge
+    crossing the *interior*). For watertight-fitting collision avoidance that is
+    the desired behaviour -- coplanar resting contact is not a penetration. A
+    grid bbox broad phase upstream is fine; this narrow phase is exact.
+
+    tri1, tri2: (P, 3, 3). Returns (P,) bool.
+    """
+    if tri1.shape[0] == 0:
+        return torch.zeros(0, dtype=torch.bool, device=tri1.device)
+    a1, b1, c1 = tri1[:, 0], tri1[:, 1], tri1[:, 2]
+    a2, b2, c2 = tri2[:, 0], tri2[:, 1], tri2[:, 2]
+    hit = torch.zeros(tri1.shape[0], dtype=torch.bool, device=tri1.device)
+    # the three edges of tri1 vs triangle tri2
+    for (s, e) in ((a1, b1), (b1, c1), (c1, a1)):
+        hit |= edgeTriangleCross(s, e, a2, b2, c2, eps=eps)
+    # the three edges of tri2 vs triangle tri1
+    for (s, e) in ((a2, b2), (b2, c2), (c2, a2)):
+        hit |= edgeTriangleCross(s, e, a1, b1, c1, eps=eps)
+    return hit
+
+
+def segmentTriangleIntersectParams(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    eps: float = 1e-9,
+    t_lo: float = 0.0,
+    t_hi: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Parametric Moller-Trumbore pierce test: where on the segment does it hit?
+
+    The segment is parameterized as ``p(t) = p + t * (q - p)`` so ``t = 0`` is the
+    rest / source endpoint (``p``) and ``t = 1`` is the proposed / current
+    endpoint (``q``) -- exactly the trajectory convention the fitter needs. For
+    every pair this returns the barycentric (u, v) of the line-plane crossing and
+    its segment parameter ``t``, plus a ``hit`` flag for the pairs whose crossing
+    lands inside the triangle AND inside the parameter window ``[t_lo, t_hi]``.
+
+    A coplanar / parallel segment (|det| < eps) does NOT pierce the sheet and is
+    reported as a non-hit, matching `segmentTriangleIntersect`. The default
+    window ``[0, 1]`` keeps the rest endpoint (``t = 0``) and the current
+    endpoint (``t = 1``) as legitimate hits; the caller can raise ``t_lo`` (e.g.
+    to a small ``start_eps``) to ignore a pre-existing touch right at the rest
+    position when only NEW crossings created by the motion are of interest.
+
+    All inputs are (P, 3). Returns (hit, t, u, v), each (P,). For non-hit pairs
+    ``t`` is set to ``+inf`` so an unconditional per-segment ``amin`` reduction
+    over the pairs yields the earliest genuine crossing without a separate mask.
+    """
+    n = p.shape[0]
+    if n == 0:
+        z = torch.zeros(0, device=p.device)
+        return z.bool(), z, z.clone(), z.clone()
+    d = q - p
+    e1 = b - a
+    e2 = c - a
+    pvec = torch.cross(d, e2, dim=-1)
+    det = _dot(e1, pvec)
+    parallel = det.abs() < eps
+    inv_det = 1.0 / torch.where(parallel, torch.ones_like(det), det)
+    tvec = p - a
+    u = _dot(tvec, pvec) * inv_det
+    qvec = torch.cross(tvec, e1, dim=-1)
+    v = _dot(d, qvec) * inv_det
+    t = _dot(e2, qvec) * inv_det
+    hit = (
+        (~parallel)
+        & (u >= -eps)
+        & (v >= -eps)
+        & (u + v <= 1.0 + eps)
+        & (t >= t_lo - eps)
+        & (t <= t_hi + eps)
+    )
+    # park non-hits at +inf so a plain amin over the candidate pairs of a segment
+    # returns its earliest real crossing parameter.
+    t_out = torch.where(hit, t, torch.full_like(t, float("inf")))
+    return hit, t_out, u, v
+
+
 def _signed_distances_to_plane(
     tri_pts: torch.Tensor, normal: torch.Tensor, d: torch.Tensor
 ) -> torch.Tensor:
